@@ -16,6 +16,17 @@ use crate::stream_follow::LiveFeed;
 use crate::stream_hls::{HlsPlaylist, HlsSegment, MAX_STREAM_FEED_PAYLOAD_BYTES};
 use crate::{Weeb3, normalize_feed_topic, strip_hex_prefix};
 use async_std::sync::Arc;
+use std::time::Duration;
+
+/// Attempts on a segment body, and the linear backoff between them.
+///
+/// Upstream's `foreground_hls_body`: six tries, 75 ms x attempt apart, with no
+/// wall-clock deadline. A segment at the live edge is often not retrievable on
+/// first ask, and these retries are part of the load a real viewer generates —
+/// so the count matters to what a fleet measures, not just to whether playback
+/// succeeds.
+const SEGMENT_BODY_ATTEMPTS: usize = 6;
+const SEGMENT_BODY_RETRY_DELAY_MS: u64 = 75;
 
 pub const SWARM_MAINNET: u64 = 1;
 pub const SWARM_TESTNET: u64 = 10;
@@ -230,14 +241,32 @@ impl Viewer {
         })
     }
 
-    /// Retrieve one segment body from peers.
+    /// Retrieve one segment body from peers, retrying as upstream does.
+    ///
+    /// See [`SEGMENT_BODY_ATTEMPTS`]. Deliberately has no overall deadline:
+    /// bounding it changes how many retrieval attempts a viewer makes, which is
+    /// exactly the quantity a load test exists to measure.
     pub async fn fetch_segment(&self, segment: &StreamSegment) -> Result<Vec<u8>, String> {
         if segment.gap {
             return Err(format!("segment {} is a gap", segment.sequence));
         }
-        self.retrieve_payload(&segment.reference)
-            .await
-            .map_err(|error| format!("segment {}: {error}", segment.sequence))
+        let mut last = String::new();
+        for attempt in 0..SEGMENT_BODY_ATTEMPTS {
+            match self.retrieve_payload(&segment.reference).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => last = error,
+            }
+            if attempt + 1 < SEGMENT_BODY_ATTEMPTS {
+                async_std::task::sleep(Duration::from_millis(
+                    SEGMENT_BODY_RETRY_DELAY_MS * (attempt + 1) as u64,
+                ))
+                .await;
+            }
+        }
+        Err(format!(
+            "segment {} after {SEGMENT_BODY_ATTEMPTS} attempts: {last}",
+            segment.sequence
+        ))
     }
 }
 
@@ -305,10 +334,16 @@ impl LiveStream {
         Some(stream_segment(sequence, &segment))
     }
 
-    /// Give up on a segment whose body will not retrieve, so playback steps over
-    /// it rather than blocking on it.
-    pub fn mark_gap(&self, segment: &StreamSegment) -> bool {
-        self.feed.mark_gap(segment.sequence, &segment.reference)
+    /// Record a failed segment body, returning `true` once it should be treated
+    /// as a gap.
+    ///
+    /// Upstream gives a failing body two strikes (`HlsTailFailure`) before
+    /// tagging it, and each strike is already six attempts inside
+    /// [`Viewer::fetch_segment`]. A caller that gets `false` should ask for the
+    /// same sequence again.
+    pub fn record_body_failure(&self, segment: &StreamSegment) -> bool {
+        self.feed
+            .record_body_failure(segment.sequence, &segment.reference)
     }
 }
 

@@ -34,8 +34,6 @@ const WATCH_MINIMUM_PEERS: u64 = 25;
 const WATCH_PEER_TIMEOUT_MS: u64 = 60_000;
 /// Segments to pull in the watch run. Enough to prove a real playback runway.
 const WATCH_SEGMENTS: usize = 8;
-/// Hard cap on one segment's fetch, as a multiple of its own duration.
-const SEGMENT_FETCH_ALLOWANCE_FACTOR: f64 = 4.0;
 
 /// What the process does once it has peered.
 enum Mode {
@@ -346,31 +344,20 @@ async fn play_live(
             continue;
         }
 
-        // Spend at most the buffer we actually hold on one segment. A body that
-        // will never retrieve otherwise costs the whole buffer and then some —
-        // measured at 16.6 s on one bad segment, which cascaded into falling off
-        // the live window. Waiting inside the buffer is free; waiting past it is
-        // a stall, and no single segment is worth one.
-        let buffer_now = (media - (clock.elapsed().as_secs_f64() - stalled_total)).max(0.0);
-        let allowance = buffer_now
-            .max(segment.duration)
-            .min(SEGMENT_FETCH_ALLOWANCE_FACTOR * segment.duration);
-
+        // No deadline on the body. `fetch_segment` already retries six times as
+        // upstream's `foreground_hls_body` does, and upstream then gives the
+        // segment a second strike before writing it off. Capping the wall time
+        // here was tried and was actively harmful — see IMPROVEMENTS.md.
         let fetch_started = Instant::now();
-        let fetch = viewer.fetch_segment(&segment);
-        let bytes = match async_std::future::timeout(Duration::from_secs_f64(allowance), fetch).await
-        {
-            Ok(Ok(bytes)) => bytes,
-            outcome => {
-                // Two failures on the same segment turn it into a gap upstream;
-                // here one is enough to stop blocking the playhead on it.
-                live.mark_gap(&segment);
-                let reason = match outcome {
-                    Ok(Err(error)) => error,
-                    _ => format!("no body within {allowance:.1}s"),
-                };
-                tracing::warn!(sequence, "{reason}; marked as a gap");
-                sequence += 1;
+        let bytes = match viewer.fetch_segment(&segment).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if live.record_body_failure(&segment) {
+                    tracing::warn!(sequence, "{error}; second strike, treating as a gap");
+                    sequence += 1;
+                } else {
+                    tracing::warn!(sequence, "{error}; first strike, asking again");
+                }
                 continue;
             }
         };

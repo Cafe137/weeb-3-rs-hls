@@ -44,7 +44,7 @@ use crate::feed::FeedProbe;
 use crate::retrieval::{probe_feed_update_status, seek_latest_feed_update_indexed};
 use crate::stream_conventions::HlsStart;
 use crate::stream_hls::{
-    HLS_LIVE_STARTUP_BUFFER_SECONDS, HlsPlaylist, HlsSegment, HlsStartupPlan,
+    HLS_LIVE_STARTUP_BUFFER_SECONDS, HlsPlaylist, HlsSegment, HlsStartupPlan, HlsTailFailure,
     MAX_STREAM_FEED_PAYLOAD_BYTES,
 };
 
@@ -54,18 +54,15 @@ const FEED_FOLLOW_AHEAD: u64 = 4;
 const FEED_POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// Idle time after which the frontier is re-resolved rather than stepped to.
 const FEED_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-/// How long a join waits for the edge to carry a startup runway.
-const LIVE_RUNWAY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Deadline on a single feed-index probe.
+/// Whole-join budget: discovery plus waiting for a startup runway.
 ///
-/// Load-bearing. Probing an index the publisher has not written yet is the
-/// follower's normal state, and without a deadline that probe waits out the
-/// retrieval layer's whole retry budget rather than failing fast — measured at
-/// over 30 s of dead air, long enough for the live window to slide away and
-/// force a needless re-anchor. The frontier seek has always bounded its probes
-/// (`FEED_FRONTIER_LOOKAHEAD_TIMEOUT`); this is the same idea at upstream's
-/// `EDGE_WAVE_TIMEOUT`.
-const FEED_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Upstream has no such bound — `discover_raw_for_view` retries forever and the
+/// browser cancelled the session on navigation. A headless binary needs one, or
+/// a mistyped topic hangs the process, so this stands in for that cancellation
+/// the same way dropping `view_generation` does.
+const LIVE_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay between discovery attempts while the publisher has written nothing yet.
+const INITIAL_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Tail slice fetched before falling back to the whole payload.
 const FEED_TAIL_PROBE_BYTES: usize = 4 * 1024;
 /// Payload size past which a tail probe is tried first.
@@ -107,6 +104,8 @@ struct LiveState {
     /// a wedged follower followed by a forced re-anchor that dumped 8 segments.
     /// The canonical playlist must keep saying exactly what the publisher said.
     gaps: HashSet<(u64, String)>,
+    /// Strike counter gating gap tagging, as upstream does it.
+    tail_failure: HlsTailFailure,
 }
 
 /// A live stream being followed.
@@ -141,17 +140,15 @@ impl LiveFeed {
         owner: String,
         topic: String,
     ) -> Result<LiveJoin, String> {
-        let (index, update) =
-            seek_latest_feed_update_indexed(owner.clone(), topic.clone(), &client.chunk_port.0)
-                .await
-                .ok_or_else(|| "no feed update found".to_string())?;
-        let root = decode_feed_payload_root(update)
-            .ok_or_else(|| format!("feed update {index} is not a readable payload"))?;
-        let bytes = retrieve_feed_payload(&root, MAX_STREAM_FEED_PAYLOAD_BYTES, &client.chunk_port.0)
+        let started = Instant::now();
+        let (index, playlist) = discover_edge(&client, &owner, &topic, started, LIVE_JOIN_TIMEOUT)
             .await
-            .ok_or_else(|| format!("feed payload at index {index} could not be retrieved"))?;
-        let playlist = HlsPlaylist::parse(&bytes)
-            .ok_or_else(|| "feed payload is not a usable HLS playlist".to_string())?;
+            .ok_or_else(|| {
+                format!(
+                    "no readable feed update after {}s: the stream may not have published yet",
+                    LIVE_JOIN_TIMEOUT.as_secs()
+                )
+            })?;
 
         let feed = Self {
             client,
@@ -162,6 +159,7 @@ impl LiveFeed {
                 index,
                 skipped: 0,
                 gaps: HashSet::new(),
+                tail_failure: HlsTailFailure::default(),
             })),
             changed: Rc::new(Event::new()),
         };
@@ -170,12 +168,11 @@ impl LiveFeed {
         // the playlist grow while we wait. Erroring out instead would make
         // joining a stream a race against its own start-up.
         feed.follow();
-        feed.await_runway(LIVE_RUNWAY_TIMEOUT).await
+        feed.await_runway(started, LIVE_JOIN_TIMEOUT).await
     }
 
     /// Wait until the live edge carries a startup runway, then anchor there.
-    async fn await_runway(self, timeout: Duration) -> Result<LiveJoin, String> {
-        let started = Instant::now();
+    async fn await_runway(self, started: Instant, timeout: Duration) -> Result<LiveJoin, String> {
         loop {
             // Listen before looking, so an update between the two is not missed.
             let listener = self.changed.listen();
@@ -304,19 +301,26 @@ impl LiveFeed {
         playlist.sequence.checked_add(position as u64)
     }
 
-    /// Record a segment as unplayable by this viewer, so playback steps over it
-    /// instead of blocking on it.
-    pub(crate) fn mark_gap(&self, sequence: u64, reference: &str) -> bool {
+    /// Record a failed segment body. `true` once it should be treated as a gap.
+    ///
+    /// Upstream requires two strikes against the same
+    /// `(feed index, sequence, reference)` before tagging a presentation gap, so
+    /// a body that is merely slow to propagate gets asked for twice more before
+    /// playback writes it off.
+    pub(crate) fn record_body_failure(&self, sequence: u64, reference: &str) -> bool {
         let mut state = self.state.borrow_mut();
-        let marked = state.gaps.insert((sequence, reference.to_string()));
+        let index = state.index;
+        if !state.tail_failure.record(index, sequence, reference) {
+            return false;
+        }
+        state.tail_failure.clear();
+        state.gaps.insert((sequence, reference.to_string()));
         // Anything the window has already shed can never be asked for again.
         let floor = state.playlist.sequence;
         state.gaps.retain(|(sequence, _)| *sequence >= floor);
         drop(state);
-        if marked {
-            self.changed.notify(usize::MAX);
-        }
-        marked
+        self.changed.notify(usize::MAX);
+        true
     }
 
     /// The follower loop.
@@ -379,14 +383,21 @@ impl LiveFeed {
 
     /// Ask the network for one feed index.
     async fn probe(&self, index: u64) -> FeedPayloadProbe {
-        let lookup =
-            probe_feed_update_status(&self.owner, &self.topic, index, &self.client.chunk_port.0);
-        let update = match async_std::future::timeout(FEED_PROBE_TIMEOUT, lookup).await {
-            Ok(FeedProbe::Found(update)) => update,
-            Ok(FeedProbe::Missing) => return FeedPayloadProbe::Missing,
-            // A probe that runs out of time is indistinguishable from one that
-            // has not been written; either way the answer is "ask again".
-            Ok(FeedProbe::Transient) | Err(_) => return FeedPayloadProbe::Transient,
+        // Unbounded, as upstream's follower is: the retrieval layer's own
+        // admission budget decides when absence is authenticated. Do not wrap
+        // this in a deadline — a probe cut short changes how many retrieval
+        // attempts a viewer makes, which is part of what the fleet measures.
+        let update = match probe_feed_update_status(
+            &self.owner,
+            &self.topic,
+            index,
+            &self.client.chunk_port.0,
+        )
+        .await
+        {
+            FeedProbe::Found(update) => update,
+            FeedProbe::Missing => return FeedPayloadProbe::Missing,
+            FeedProbe::Transient => return FeedPayloadProbe::Transient,
         };
         let Some(root) = decode_feed_payload_root(update) else {
             return FeedPayloadProbe::Transient;
@@ -515,6 +526,42 @@ impl LiveFeed {
             "HLS re-anchored at {index}; {skipped} segment(s) skipped"
         ));
         true
+    }
+}
+
+/// Resolve the newest feed update and parse it, retrying while there is nothing
+/// to read yet.
+///
+/// Mirrors upstream's `discover_raw_for_view`: a stream whose publisher has not
+/// written its first manifest is not an error, it is a stream that has not
+/// started. Failing on the first empty seek made joining a stream a race against
+/// its own first upload.
+async fn discover_edge(
+    client: &Arc<Weeb3>,
+    owner: &str,
+    topic: &str,
+    started: Instant,
+    timeout: Duration,
+) -> Option<(u64, HlsPlaylist)> {
+    loop {
+        if let Some((index, update)) = seek_latest_feed_update_indexed(
+            owner.to_string(),
+            topic.to_string(),
+            &client.chunk_port.0,
+        )
+        .await
+            && let Some(root) = decode_feed_payload_root(update)
+            && let Some(bytes) =
+                retrieve_feed_payload(&root, MAX_STREAM_FEED_PAYLOAD_BYTES, &client.chunk_port.0)
+                    .await
+            && let Some(playlist) = HlsPlaylist::parse(&bytes)
+        {
+            return Some((index, playlist));
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        async_std::task::sleep(INITIAL_DISCOVERY_RETRY_DELAY).await;
     }
 }
 
