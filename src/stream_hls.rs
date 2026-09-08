@@ -542,7 +542,7 @@ fn is_hex_reference(value: &str) -> bool {
 mod publisher_compat_tests {
     use super::*;
 
-    /// Manifests captured from real `@everstream/publisher` runs against mainnet.
+    /// Manifests captured from real `swarm-fleet publish` runs against mainnet.
     ///
     /// These are the contract between the publisher and this module. A live
     /// viewer follows a feed by merging each new manifest onto the one it holds,

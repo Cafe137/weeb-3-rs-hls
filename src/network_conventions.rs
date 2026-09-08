@@ -656,6 +656,12 @@ pub(crate) struct Wings {
     pub(crate) known_peers: Mutex<HashMap<PeerId, KnownPeer>>,
     pub(crate) delayed_peer_retries: DelayedPeerRetryMap,
     pub(crate) rejected_duplicate_peers: Mutex<HashMap<PeerId, PeerId>>,
+    /// Outbound dials that failed, for any reason, since the node started.
+    ///
+    /// A rising count is how a fleet distinguishes "Swarm is slow" from "this
+    /// machine ran out of ephemeral ports", which are the same symptom from the
+    /// outside and opposite conclusions.
+    pub(crate) dial_failures: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) async fn get_or_create_accounting_peer(

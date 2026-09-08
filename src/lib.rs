@@ -287,6 +287,12 @@ impl Weeb3 {
         self.connection_population.lock().await.connected
     }
 
+    pub(crate) fn get_dial_failures(&self) -> u64 {
+        self.wings
+            .dial_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn interface_log(&self, log0: String) {
         interface_log_to(&self.log_port.0, self.log_start_ms, log0);
     }
@@ -755,6 +761,12 @@ impl Weeb3 {
                             connection_id,
                             error,
                         } => {
+                            // Counted first: every path out of this arm is an
+                            // outbound dial that did not connect, and several
+                            // of them return early.
+                            wings
+                                .dial_failures
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let retryable = !matches!(
                                 &error,
                                 libp2p::swarm::DialError::LocalPeerId { .. }

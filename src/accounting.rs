@@ -1,4 +1,24 @@
-pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Peer connections a viewer builds toward.
+///
+/// 200 is the real browser client's footprint and stays the default: it is the
+/// main lever on fleet density, and if the test is meant to stress peering then
+/// lowering it lowers the thing being measured. A load rig sweeps it instead.
+///
+/// Process-wide, which is correct here rather than merely convenient: one
+/// process is one viewer, because the decoded-chunk cache is a `thread_local!`
+/// and viewers sharing a process would serve each other out of local memory.
+static CONNECTION_BUILDUP_LIMIT: AtomicU64 = AtomicU64::new(200);
+
+pub(crate) fn connection_buildup_limit() -> u64 {
+    CONNECTION_BUILDUP_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Override the peer limit. Must be called before the node starts dialing.
+pub(crate) fn set_connection_buildup_limit(limit: u64) {
+    CONNECTION_BUILDUP_LIMIT.store(limit.max(1), Ordering::Relaxed);
+}
 pub(crate) const REFRESH_RATE: u64 = 450000;
 const PO_PRICE: u64 = 10000;
 pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_threshold: u64) -> bool {
@@ -20,7 +40,7 @@ pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64) -
 }
 
 pub(crate) fn connection_population_deficit(connected: u64, ongoing: u64) -> u64 {
-    CONNECTION_BUILDUP_LIMIT.saturating_sub(connected.saturating_add(ongoing))
+    connection_buildup_limit().saturating_sub(connected.saturating_add(ongoing))
 }
 
 pub(crate) fn bee_reconnect_delay_seconds(

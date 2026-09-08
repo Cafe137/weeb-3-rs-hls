@@ -1,0 +1,155 @@
+name: build
+
+# Every commit produces the Linux AMD64 binary the fleet runner deploys.
+#
+# This exists because a load rig's numbers are only comparable if every viewer
+# in every run is the same build, and the binary a developer has locally is a
+# Mach-O that cannot execute on the Linux boxes a fleet actually runs on. So the
+# authoritative `weeb-3-rs-hls` is the artifact below, and
+# `swarm-fleet deploy --from-github` pulls it from here.
+#
+# Two choices worth knowing about:
+#
+#   * **ubuntu-22.04, not ubuntu-latest.** The binary links glibc, and a binary
+#     built against a newer glibc than the target has will not start. 22.04
+#     gives glibc 2.35, which runs on Debian 12, Ubuntu 22.04 and everything
+#     newer. If the fleet ever has to reach older or musl-based hosts, the fix
+#     is a `x86_64-unknown-linux-musl` target — statically linked, runs
+#     anywhere — which needs `musl-tools` plus `cmake`/`clang` for the
+#     `aws-lc-sys` C code that rustls pulls in. Untested here, so not enabled.
+#   * **`--locked`.** The dependency tree includes git dependencies (libp2p,
+#     alloy-primitives, async-std) pinned only by `Cargo.lock`. Building
+#     without it would silently drift to different revisions and produce a
+#     binary that is not the one this commit describes.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A load-test binary is built once and run thousands of times; the extra
+  # minute here is free.
+  CARGO_INCREMENTAL: '0'
+  # The tree is warning-free and worth keeping that way: 414 warnings once hid a
+  # progress store that allocated on every retrieval and was never read. Cargo
+  # caps lints for dependencies, so this judges this crate only. Set for the
+  # whole job so `build` and `test` share one set of compiled artifacts.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  linux-amd64:
+    name: linux amd64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # `build.rs` compiles the Swarm protobufs with prost, which shells out to
+      # protoc. Without this the build fails in the build script, before any of
+      # the crate is compiled.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # The git dependencies are slow to fetch and slow to compile, and they
+      # change only when Cargo.lock does.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-amd64
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      # What the binary actually is, recorded in the log. The viewer dials
+      # mainnet the moment it runs, so CI does not run it: the failure this
+      # catches is a link error or an unexpected dependency, which `ldd` shows
+      # without opening a socket.
+      - name: Inspect
+        run: |
+          file ./target/release/weeb-3-rs-hls
+          ldd ./target/release/weeb-3-rs-hls
+
+      - name: Package
+        id: package
+        run: |
+          mkdir -p dist
+          cp target/release/weeb-3-rs-hls dist/weeb-3-rs-hls
+          strip dist/weeb-3-rs-hls
+          cd dist
+          sha256sum weeb-3-rs-hls | tee weeb-3-rs-hls.sha256
+          # Recorded so a fleet run can name the commit its viewers came from
+          # without going back to the workflow.
+          echo "${GITHUB_SHA}" > commit.txt
+          ls -la
+          echo "sha256=$(cut -d' ' -f1 weeb-3-rs-hls.sha256)" >> "$GITHUB_OUTPUT"
+
+      # The name the fleet runner looks for: `deploy --from-github` downloads
+      # this artifact from the most recent successful run of this workflow.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weeb-3-rs-hls-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          {
+            echo "### weeb-3-rs-hls linux amd64"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| sha256 | \`${{ steps.package.outputs.sha256 }}\` |"
+            echo "| size | $(stat -c %s dist/weeb-3-rs-hls) bytes |"
+            echo
+            echo '```sh'
+            echo "swarm-fleet deploy --from-github --agent <host>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # A rolling prerelease, so the binary is also reachable without a GitHub
+  # token: workflow artifacts need an authenticated download, release assets do
+  # not. `deploy --from-github --github-tag nightly` takes this one.
+  nightly:
+    name: nightly release
+    needs: linux-amd64
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: weeb-3-rs-hls-linux-amd64
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mv dist/weeb-3-rs-hls dist/weeb-3-rs-hls-linux-amd64
+          mv dist/weeb-3-rs-hls.sha256 dist/weeb-3-rs-hls-linux-amd64.sha256
+          # The tag moves with main, so the release always describes the head of
+          # the branch rather than accumulating one release per commit.
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly \
+            --prerelease \
+            --title "nightly (${GITHUB_SHA:0:12})" \
+            --notes "Linux AMD64 build of \`weeb-3-rs-hls\` at \`${GITHUB_SHA}\`. Built on ubuntu-22.04 (glibc 2.35). Deploy it with \`swarm-fleet deploy --from-github --github-tag nightly --agent <host>\`." \
+            --target "${GITHUB_SHA}" \
+            dist/weeb-3-rs-hls-linux-amd64 \
+            dist/weeb-3-rs-hls-linux-amd64.sha256

@@ -125,6 +125,14 @@ impl Viewer {
         self.inner.wait_for_connections(minimum, timeout_ms).await
     }
 
+    /// Outbound dials that failed since the node started.
+    ///
+    /// Rising while peers stay flat is the ephemeral-port ceiling, not a slow
+    /// network: a fleet cannot tell those apart from throughput alone.
+    pub fn dial_failures(&self) -> u64 {
+        self.inner.get_dial_failures()
+    }
+
     /// Live occupancy of every in-process cache that can retain retrieved
     /// content. Diagnostic: use it to attribute RSS growth to a specific cache
     /// rather than to the allocator.
@@ -247,13 +255,28 @@ impl Viewer {
     /// bounding it changes how many retrieval attempts a viewer makes, which is
     /// exactly the quantity a load test exists to measure.
     pub async fn fetch_segment(&self, segment: &StreamSegment) -> Result<Vec<u8>, String> {
+        self.fetch_segment_reporting(segment)
+            .await
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// As [`Viewer::fetch_segment`], reporting how many attempts it took.
+    ///
+    /// The attempt count is part of the load a viewer places on the network, so
+    /// a rig that only records whether a body arrived is under-reporting: the
+    /// ~2-5% of segments that need a second or third ask are requests the
+    /// network actually served.
+    pub async fn fetch_segment_reporting(
+        &self,
+        segment: &StreamSegment,
+    ) -> Result<(Vec<u8>, usize), String> {
         if segment.gap {
             return Err(format!("segment {} is a gap", segment.sequence));
         }
         let mut last = String::new();
         for attempt in 0..SEGMENT_BODY_ATTEMPTS {
             match self.retrieve_payload(&segment.reference).await {
-                Ok(bytes) => return Ok(bytes),
+                Ok(bytes) => return Ok((bytes, attempt + 1)),
                 Err(error) => last = error,
             }
             if attempt + 1 < SEGMENT_BODY_ATTEMPTS {
@@ -268,6 +291,20 @@ impl Viewer {
             segment.sequence
         ))
     }
+}
+
+/// Set the peer connection limit before starting a node.
+///
+/// Defaults to 200, the browser client's footprint. Exposed because it is the
+/// main lever on how many viewers fit on a machine, and a load rig has to be
+/// able to sweep it — not because lowering it is a good idea by itself.
+pub fn set_peer_limit(limit: u64) {
+    crate::accounting::set_connection_buildup_limit(limit);
+}
+
+/// The peer connection limit this process will build toward.
+pub fn peer_limit() -> u64 {
+    crate::accounting::connection_buildup_limit()
 }
 
 /// A live stream being followed forward.
