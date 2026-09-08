@@ -1,0 +1,1 @@
+[{"inputs":[{"name":"issuer","type":"address"},{"name":"defaultHardDepositTimeoutDuration","type":"uint256"},{"name":"salt","type":"bytes32"}],"name":"deploySimpleSwap","outputs":[{"name":"","type":"address"}],"stateMutability":"nonpayable","type":"function"}]

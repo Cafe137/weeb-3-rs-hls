@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package weeb_3.etiquette_2;
+
+import "etiquette_1.proto";
+
+message Peers {
+    repeated weeb_3.etiquette_1.BzzAddress peers = 1;
+}
