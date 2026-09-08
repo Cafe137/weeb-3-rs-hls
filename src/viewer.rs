@@ -12,7 +12,8 @@
 use crate::bzz_stream::{decode_feed_payload_root, retrieve_feed_payload};
 use crate::network_profile::{initial_bootnodes, profile_for_swarm_network_id};
 use crate::retrieval::{retrieval_cache_stats, retrieve_data_payload, seek_latest_feed_update_indexed};
-use crate::stream_hls::{HlsPlaylist, MAX_STREAM_FEED_PAYLOAD_BYTES};
+use crate::stream_follow::LiveFeed;
+use crate::stream_hls::{HlsPlaylist, HlsSegment, MAX_STREAM_FEED_PAYLOAD_BYTES};
 use crate::{Weeb3, normalize_feed_topic, strip_hex_prefix};
 use async_std::sync::Arc;
 
@@ -30,6 +31,12 @@ pub struct StreamSegment {
     pub duration: f64,
     /// A `#EXT-X-GAP` placeholder: no body is retrievable for it.
     pub gap: bool,
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE` this segment belongs to.
+    ///
+    /// Bodies either side of a change here do not concatenate into a decodable
+    /// stream: the encoder restarted, so timestamps and possibly codec
+    /// parameters reset. Anything joining segment bodies must break here.
+    pub discontinuity_sequence: u64,
 }
 
 /// A stream playlist resolved from a Swarm feed.
@@ -49,6 +56,8 @@ pub struct StreamPlaylist {
     pub target_duration: u64,
     /// `#EXT-X-ENDLIST` present: the stream is complete (VOD).
     pub finalized: bool,
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE` of the first segment listed.
+    pub discontinuity_sequence: u64,
     pub segments: Vec<StreamSegment>,
 }
 
@@ -189,26 +198,35 @@ impl Viewer {
     }
 
     /// Resolve a stream's feed and parse its payload as an HLS playlist.
+    ///
+    /// One snapshot, taken once. For a stream still being published, see
+    /// [`Viewer::watch_live`].
     pub async fn playlist(&self, owner: &str, topic: &str) -> Result<StreamPlaylist, String> {
         let (feed_index, bytes) = self.resolve_feed(owner, topic).await?;
         let playlist = HlsPlaylist::parse(&bytes)
             .ok_or_else(|| "feed payload is not a usable HLS playlist".to_string())?;
-        Ok(StreamPlaylist {
-            feed_index,
-            sequence: playlist.sequence,
-            target_duration: playlist.target_duration,
-            finalized: playlist.finalized,
-            segments: playlist
-                .segments
-                .iter()
-                .enumerate()
-                .map(|(offset, segment)| StreamSegment {
-                    sequence: playlist.sequence.saturating_add(offset as u64),
-                    reference: segment.reference.clone(),
-                    duration: segment.duration,
-                    gap: segment.gap,
-                })
-                .collect(),
+        Ok(stream_playlist(feed_index, &playlist))
+    }
+
+    /// Join a live stream at its edge and start following the feed forward.
+    ///
+    /// Anchors [`LiveStream::start_sequence`] far enough behind the newest
+    /// segment to give playback a startup buffer, then leaves a task polling the
+    /// feed so the playlist grows as the publisher writes it.
+    ///
+    /// Waits for the edge to carry a runway rather than failing on a stream that
+    /// has only just started. Fails after 30 seconds, which in practice means the
+    /// publisher's live window is under 8 seconds and cannot be joined live at
+    /// all, however healthy the stream is.
+    pub async fn watch_live(&self, owner: &str, topic: &str) -> Result<LiveStream, String> {
+        let owner = normalize_feed_owner(owner)?;
+        let topic = normalize_feed_topic(topic);
+        let join = LiveFeed::join(self.inner.clone(), owner, topic).await?;
+        Ok(LiveStream {
+            feed: join.feed,
+            start_sequence: join.start_sequence,
+            joined_at: join.feed_index,
+            runway_seconds: join.plan.runway_end - join.plan.play_position,
         })
     }
 
@@ -220,6 +238,105 @@ impl Viewer {
         self.retrieve_payload(&segment.reference)
             .await
             .map_err(|error| format!("segment {}: {error}", segment.sequence))
+    }
+}
+
+/// A live stream being followed forward.
+///
+/// The feed is polled by a background task on the same `LocalSet`, so the
+/// playlist grows underneath this handle. Ask for segments by sequence number
+/// and pace the asking yourself: [`LiveStream::segment`] waits for a segment the
+/// publisher has not written yet, which is what makes a real stall observable.
+pub struct LiveStream {
+    feed: LiveFeed,
+    start_sequence: u64,
+    joined_at: u64,
+    runway_seconds: f64,
+}
+
+impl LiveStream {
+    /// Media sequence to start playback from.
+    pub fn start_sequence(&self) -> u64 {
+        self.start_sequence
+    }
+
+    /// Feed index the edge was joined at.
+    pub fn joined_at(&self) -> u64 {
+        self.joined_at
+    }
+
+    /// Buffer available at the join, in seconds.
+    pub fn runway_seconds(&self) -> f64 {
+        self.runway_seconds
+    }
+
+    /// Highest feed index applied so far.
+    pub fn feed_index(&self) -> u64 {
+        self.feed.feed_index()
+    }
+
+    /// `#EXT-X-ENDLIST` has arrived: the publisher stopped.
+    pub fn finalized(&self) -> bool {
+        self.feed.finalized()
+    }
+
+    /// Segments the live window slid past before this viewer reached them.
+    pub fn skipped(&self) -> u64 {
+        self.feed.skipped()
+    }
+
+    /// The playlist as currently known.
+    pub fn playlist(&self) -> StreamPlaylist {
+        stream_playlist(self.feed.feed_index(), &self.feed.snapshot())
+    }
+
+    /// Media sequence of the newest playable segment.
+    pub fn live_sequence(&self) -> Option<u64> {
+        self.feed.live_sequence()
+    }
+
+    /// The segment at `sequence`, waiting for the publisher to write it.
+    ///
+    /// `None` means it will never arrive: either the stream finalized short of
+    /// it, or the live window slid past it. Callers should then resume from
+    /// [`LiveStream::live_sequence`].
+    pub async fn segment(&self, sequence: u64) -> Option<StreamSegment> {
+        let segment = self.feed.segment_at(sequence).await?;
+        Some(stream_segment(sequence, &segment))
+    }
+
+    /// Give up on a segment whose body will not retrieve, so playback steps over
+    /// it rather than blocking on it.
+    pub fn mark_gap(&self, segment: &StreamSegment) -> bool {
+        self.feed.mark_gap(segment.sequence, &segment.reference)
+    }
+}
+
+fn stream_segment(sequence: u64, segment: &HlsSegment) -> StreamSegment {
+    StreamSegment {
+        sequence,
+        reference: segment.reference.clone(),
+        duration: segment.duration,
+        gap: segment.gap,
+        discontinuity_sequence: segment.discontinuity_sequence,
+    }
+}
+
+fn stream_playlist(feed_index: u64, playlist: &HlsPlaylist) -> StreamPlaylist {
+    StreamPlaylist {
+        feed_index,
+        sequence: playlist.sequence,
+        target_duration: playlist.target_duration,
+        finalized: playlist.finalized,
+        discontinuity_sequence: playlist.discontinuity_sequence,
+        segments: playlist
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(offset, segment)| {
+                stream_segment(playlist.sequence.saturating_add(offset as u64), segment)
+            })
+            .collect(),
     }
 }
 

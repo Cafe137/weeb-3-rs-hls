@@ -2077,7 +2077,7 @@ async fn get_feed_probe_chunk(
     }
 }
 
-async fn probe_feed_update_status(
+pub(crate) async fn probe_feed_update_status(
     owner: &str,
     topic: &str,
     index: u64,

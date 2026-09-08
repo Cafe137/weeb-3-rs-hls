@@ -1,13 +1,21 @@
 //! Minimal append-only HLS feed reader with a duration-based live startup runway.
 //!
-//! Only `parse` is on the viewer's path today: it turns a feed payload into a
-//! playlist, and `viewer::Viewer::playlist` stops there. Everything past it is
-//! the live path - startup runways, tail merging, playlist reconstruction, gap
-//! tagging - and stays unreachable until `HlsStart::Live` is wired through
-//! `viewer.rs`. It is kept rather than reaped because it encodes HLS sequencing
-//! semantics (discontinuity sequences, tail joins, gap segments) that are
-//! fiddly to re-derive, so the allow below is deliberate and scoped to this
-//! module.
+//! Most of this module is now on the viewer's path: `parse` for a snapshot,
+//! and `startup_plan`, `anchored_startup_plan`, `merge_playlist`, `merge_tail`
+//! and `mark_gap` for the live follower in `stream_follow`.
+//!
+//! Four things remain unreachable, and the allow below is scoped to this module
+//! for their sake:
+//!
+//! - `joins` is used only by the tests.
+//! - `reconstruct` rebuilds the archive behind a live edge from strided
+//!   snapshots. The follower re-anchors at the new edge instead, which is what a
+//!   player does; this is kept for whenever the archive is actually wanted.
+//! - `render` / `render_with_plan` serialize a playlist back to text, which the
+//!   browser needed to hand to hls.js and a native viewer does not.
+//! - `HlsTailFailure` counted strikes for upstream's tail-fallback path, which
+//!   *retreated* the playhead when the newest segment would not load. Our
+//!   playhead only moves forward.
 #![allow(dead_code)]
 
 use std::fmt::Write;
@@ -530,3 +538,159 @@ fn is_hex_reference(value: &str) -> bool {
 }
 
 
+#[cfg(test)]
+mod publisher_compat_tests {
+    use super::*;
+
+    /// Manifests captured from real `@everstream/publisher` runs against mainnet.
+    ///
+    /// These are the contract between the publisher and this module. A live
+    /// viewer follows a feed by merging each new manifest onto the one it holds,
+    /// so if `merge_extension` ever rejected a consecutive pair the viewer would
+    /// stall the moment the window slid. That is cheap to catch here and
+    /// expensive to catch on mainnet.
+    ///
+    /// `live-default`: 13 segments of 2 s through a 10-segment window, so the
+    /// window fills and then slides.
+    const LIVE_DEFAULT: [&str; 13] = [
+        include_str!("../tests/fixtures/live-default/0000.m3u8"),
+        include_str!("../tests/fixtures/live-default/0001.m3u8"),
+        include_str!("../tests/fixtures/live-default/0002.m3u8"),
+        include_str!("../tests/fixtures/live-default/0003.m3u8"),
+        include_str!("../tests/fixtures/live-default/0004.m3u8"),
+        include_str!("../tests/fixtures/live-default/0005.m3u8"),
+        include_str!("../tests/fixtures/live-default/0006.m3u8"),
+        include_str!("../tests/fixtures/live-default/0007.m3u8"),
+        include_str!("../tests/fixtures/live-default/0008.m3u8"),
+        include_str!("../tests/fixtures/live-default/0009.m3u8"),
+        include_str!("../tests/fixtures/live-default/0010.m3u8"),
+        include_str!("../tests/fixtures/live-default/0011.m3u8"),
+        include_str!("../tests/fixtures/live-default/0012.m3u8"),
+    ];
+    const VOD_DEFAULT: &str = include_str!("../tests/fixtures/live-default/0013.m3u8");
+
+    /// `live-window`: the same, through a deliberately narrow 3-segment window.
+    const LIVE_NARROW: [&str; 7] = [
+        include_str!("../tests/fixtures/live-window/0000.m3u8"),
+        include_str!("../tests/fixtures/live-window/0001.m3u8"),
+        include_str!("../tests/fixtures/live-window/0002.m3u8"),
+        include_str!("../tests/fixtures/live-window/0003.m3u8"),
+        include_str!("../tests/fixtures/live-window/0004.m3u8"),
+        include_str!("../tests/fixtures/live-window/0005.m3u8"),
+        include_str!("../tests/fixtures/live-window/0006.m3u8"),
+    ];
+    const VOD_NARROW: &str = include_str!("../tests/fixtures/live-window/0007.m3u8");
+
+    fn parsed(body: &str, label: &str) -> HlsPlaylist {
+        HlsPlaylist::parse(body.as_bytes())
+            .unwrap_or_else(|| panic!("{label} did not parse as a playlist"))
+    }
+
+    #[test]
+    fn publisher_manifests_parse() {
+        for (set, bodies) in [("default", &LIVE_DEFAULT[..]), ("narrow", &LIVE_NARROW[..])] {
+            for (at, body) in bodies.iter().enumerate() {
+                let playlist = parsed(body, &format!("{set} live manifest {at}"));
+                assert!(!playlist.finalized, "{set} {at}: a live manifest has no ENDLIST");
+                assert_eq!(playlist.target_duration, 2, "{set} {at}");
+                assert!(!playlist.segments.is_empty(), "{set} {at}");
+                for segment in &playlist.segments {
+                    // The publisher writes gateway URLs; only the trailing
+                    // reference survives parsing, and the viewer retrieves that
+                    // from peers.
+                    assert_eq!(
+                        segment.reference.len(),
+                        64,
+                        "{set} {at}: {} is not a bare reference",
+                        segment.reference
+                    );
+                    assert!(
+                        segment.reference.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                        "{set} {at}: {} is not hex",
+                        segment.reference
+                    );
+                    assert!(!segment.gap, "{set} {at}");
+                    assert_eq!(segment.discontinuity_sequence, 0, "{set} {at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_closing_manifest_is_finalized_and_complete() {
+        for (set, body, expected) in [("default", VOD_DEFAULT, 13), ("narrow", VOD_NARROW, 7)] {
+            let playlist = parsed(body, &format!("{set} vod manifest"));
+            assert!(playlist.finalized, "{set}: ENDLIST should finalize the playlist");
+            assert_eq!(playlist.sequence, 0, "{set}");
+            assert_eq!(playlist.segments.len(), expected, "{set}");
+        }
+    }
+
+    /// A follower only ever sees a window, but has to end up holding the stream.
+    #[test]
+    fn sliding_window_manifests_merge_into_the_whole_stream() {
+        for (set, bodies, vod) in [
+            ("default", &LIVE_DEFAULT[..], VOD_DEFAULT),
+            ("narrow", &LIVE_NARROW[..], VOD_NARROW),
+        ] {
+            let mut accumulated = parsed(bodies[0], &format!("{set} live manifest 0"));
+            assert_eq!(accumulated.segments.len(), 1, "{set}");
+
+            for (at, body) in bodies.iter().enumerate().skip(1) {
+                let candidate = parsed(body, &format!("{set} live manifest {at}"));
+                assert!(
+                    accumulated.joins(&candidate),
+                    "{set} {at}: manifest does not join the head we hold"
+                );
+                let appended = accumulated
+                    .merge_playlist(candidate)
+                    .unwrap_or_else(|| panic!("{set} {at}: manifest did not merge"));
+                assert_eq!(appended, 1, "{set} {at}: one new segment per update");
+            }
+
+            // Reconstructed from the front, even though the window slid past it.
+            assert_eq!(accumulated.sequence, 0, "{set}");
+            assert_eq!(accumulated.segments.len(), bodies.len(), "{set}");
+            assert!(!accumulated.finalized, "{set}");
+
+            // The closing update adds no segments, only the ENDLIST.
+            let closing = parsed(vod, &format!("{set} vod manifest"));
+            assert_eq!(accumulated.merge_playlist(closing), Some(0), "{set}");
+            assert!(accumulated.finalized, "{set}");
+        }
+    }
+
+    /// Live playback joins at the edge, so the runway is measured backwards from
+    /// the last segment rather than forwards from the first.
+    #[test]
+    fn live_startup_plan_anchors_at_the_edge() {
+        let edge = parsed(
+            LIVE_DEFAULT[LIVE_DEFAULT.len() - 1],
+            "default live manifest at the edge",
+        );
+        let plan = edge
+            .startup_plan(HlsStart::Live)
+            .expect("a full 10-segment window carries a live runway");
+        assert!(plan.runway_end > plan.play_position);
+        assert!(plan.runway_end - plan.play_position >= HLS_LIVE_STARTUP_BUFFER_SECONDS);
+    }
+
+    /// A window shorter than the startup buffer cannot be joined live at all.
+    ///
+    /// `anchored_startup_plan` needs `HLS_LIVE_STARTUP_BUFFER_SECONDS` of
+    /// contiguous non-gap segments behind the edge. Three 2 s segments is 6 s,
+    /// which is less than 8, so no plan exists however healthy the stream is.
+    /// The publisher's window therefore has a floor: at 2 s segments it must
+    /// carry at least four, and the upstream default of ten is what it is for a
+    /// reason.
+    #[test]
+    fn a_window_shorter_than_the_startup_buffer_has_no_live_runway() {
+        let edge = parsed(
+            LIVE_NARROW[LIVE_NARROW.len() - 1],
+            "narrow live manifest at the edge",
+        );
+        assert_eq!(edge.duration(), 6.0);
+        assert!(edge.duration() < HLS_LIVE_STARTUP_BUFFER_SECONDS);
+        assert!(edge.startup_plan(HlsStart::Live).is_none());
+    }
+}

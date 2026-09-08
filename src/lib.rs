@@ -61,6 +61,7 @@ mod feed;
 mod handlers;
 use handlers::*;
 
+mod stream_follow;
 mod stream_hls;
 
 

@@ -81,21 +81,41 @@ pub(crate) async fn retrieve_feed_payload(
     (u64::try_from(bytes.len()).ok()? == span).then_some(bytes)
 }
 
+impl FeedPayloadRoot {
+    /// Declared payload length of this feed update, in bytes.
+    pub(crate) fn span(&self) -> u64 {
+        self.root.span
+    }
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/// Retrieve only the last `maximum_tail_bytes` of a feed payload.
+///
+/// A live playlist grows at the back, so for a payload larger than one chunk the
+/// tail alone carries the new `#EXTINF` lines and `HlsPlaylist::merge_tail` can
+/// append them without walking the whole bytes tree. Capped at one chunk, which
+/// is what makes it a single retrieval rather than a range walk.
+pub(crate) async fn retrieve_feed_payload_tail(
+    payload: &FeedPayloadRoot,
+    maximum_tail_bytes: usize,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<Vec<u8>> {
+    let maximum_tail_bytes = u64::try_from(maximum_tail_bytes)
+        .ok()?
+        .min(CHUNK_SIZE as u64);
+    let span = payload.root.span;
+    if span == 0 || maximum_tail_bytes == 0 {
+        return None;
+    }
+    let start = span.saturating_sub(maximum_tail_bytes);
+    let end_inclusive = span.checked_sub(1)?;
+    let expected_len = end_inclusive.checked_sub(start)?.checked_add(1)?;
+    let tail = retrieve_data_range_from_root(
+        payload.root.clone(),
+        start,
+        end_inclusive,
+        payload.encrypted,
+        chunk_retrieve_chan,
+    )
+    .await?;
+    (u64::try_from(tail.len()).ok()? == expected_len).then_some(tail)
+}
