@@ -53,56 +53,6 @@ impl Weeb3 {
     }
 }
 
-pub(crate) fn js_error_message(error: &JsValue) -> String {
-    crate::worker_protocol::string_property(error, "message")
-        .or_else(|| error.as_string())
-        .unwrap_or_else(|| "unknown browser error".to_string())
-}
-
-pub(crate) fn spawn_upload_progress_listener(
-    progress_store: Arc<Mutex<ProgressStore>>,
-    progress_id: String,
-    progress_in: mpsc::Receiver<UploadProgressDelta>,
-) {
-    spawn_local(async move {
-        let mut chunks_total = 0u64;
-        let mut chunks_done = 0u64;
-        let mut last_render = 0.0;
-
-        while let Ok(delta) = progress_in.recv().await {
-            chunks_total = chunks_total.saturating_add(delta.chunks_total_delta);
-            chunks_done = chunks_done.saturating_add(delta.chunks_done_delta);
-
-            if chunks_total > 0 {
-                chunks_done = chunks_done.min(chunks_total);
-            }
-
-            let complete = chunks_total > 0 && chunks_done >= chunks_total;
-            let now = Date::now();
-            if !complete && now - last_render < 250.0 && !chunks_done.is_multiple_of(64) {
-                continue;
-            }
-
-            let percent = if chunks_total > 0 {
-                Some(((chunks_done.saturating_mul(100)) / chunks_total).min(100) as u8)
-            } else {
-                None
-            };
-            let detail = if chunks_total > 0 {
-                format!("{} of {} chunks pushed", chunks_done, chunks_total)
-            } else {
-                "waiting for chunk plan".to_string()
-            };
-
-            progress_store
-                .lock()
-                .await
-                .update(&progress_id, "push", percent, detail);
-            last_render = now;
-        }
-    });
-}
-
 pub(crate) fn interface_log_to(log_port: &mpsc::Sender<String>, log_start_ms: f64, log0: String) {
     if log_port.is_full() {
         return;
@@ -112,37 +62,7 @@ pub(crate) fn interface_log_to(log_port: &mpsc::Sender<String>, log_start_ms: f6
     let _ = log_port.try_send(log);
 }
 
-pub(crate) async fn cheques_active_in_window() -> bool {
-    if get_chequebook_signer_key().await.is_empty() {
-        return false;
-    }
-
-    let chequebook = get_chequebook_address().await;
-    if chequebook.len() != 20 {
-        return false;
-    }
-
-    let w3 = match web3() {
-        Ok(w3) => w3,
-        Err(_) => return false,
-    };
-
-    chequebook_balance(&w3, web3::types::Address::from_slice(&chequebook))
-        .await
-        .is_ok_and(|balance| !balance.is_zero())
-}
-
 pub(crate) type AsyncPort<T> = (mpsc::Sender<T>, mpsc::Receiver<T>);
-pub(crate) type UploadRequest = (
-    Vec<Resource>,
-    bool,
-    erasure_coding::RedundancyLevel,
-    String,
-    bool,
-    String,
-    Option<UploadProgressSender>,
-    mpsc::Sender<Vec<u8>>,
-);
 pub(crate) type BootnodeChange = (String, bool, u64);
 
 #[derive(Clone)]
@@ -207,4 +127,16 @@ pub(crate) struct BzzRangeRequest {
     pub(crate) end_inclusive: u64,
     pub(crate) cancel: Option<RetrieveCancelToken>,
     pub(crate) chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
+}
+
+/// Native replacement for `js_sys::Date`: milliseconds since the Unix epoch.
+pub(crate) struct Date;
+
+impl Date {
+    pub(crate) fn now() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as f64
+    }
 }

@@ -1,7 +1,4 @@
-#![cfg(target_arch = "wasm32")]
 
-use crate::upload::{Resource, ResourceData};
-use std::io::Read;
 
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
@@ -9,15 +6,15 @@ use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
 pub use crate::erasure_coding::SPAN_SIZE;
 use crate::erasure_coding::{CHUNK_SIZE, HASH_SIZE};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-use web3::types::Address;
+use alloy_primitives::Address;
 
 #[inline]
 pub(crate) fn keccak256(input: impl AsRef<[u8]>) -> [u8; 32] {
-    web3::signing::keccak256(input.as_ref())
+    alloy_primitives::keccak256(input.as_ref()).0
 }
 
 pub(crate) fn eip191_hash_message(message: &[u8]) -> [u8; 32] {
-    web3::signing::hash_message(message).0
+    alloy_primitives::eip191_hash_message(message).0
 }
 
 pub(crate) fn public_key_address(key: &k256::ecdsa::VerifyingKey) -> Address {
@@ -51,7 +48,7 @@ pub(crate) fn bee_replica_address(id: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
 pub struct PeerFile {
     pub peer_id: PeerId,
     pub overlay: Vec<u8>,
-    pub beneficiary: web3::types::Address,
+    pub beneficiary: alloy_primitives::Address,
     pub connection_attempt_id: usize,
     pub connection_id: ConnectionId,
 }
@@ -198,7 +195,7 @@ pub fn valid_soc(chunk_content: &[u8], address: &[u8]) -> bool {
     };
     let mut address_input = [0_u8; 52];
     address_input[..32].copy_from_slice(soc_address);
-    address_input[32..].copy_from_slice(owner.as_bytes());
+    address_input[32..].copy_from_slice(owner.as_slice());
     address == keccak256(address_input).as_slice()
 }
 
@@ -258,62 +255,6 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)
     crate::erasure_coding::decode_resource_bundle(&encoded_data).unwrap_or_default()
 }
 
-pub(crate) fn tar_resources(content: &[u8]) -> std::io::Result<Vec<Resource>> {
-    let mut archive = tar::Archive::new(content);
-    Ok(archive
-        .entries()?
-        .filter_map(|entry| {
-            let mut entry = entry.ok()?;
-            if !entry.header().entry_type().is_file() {
-                return None;
-            }
-            let path = entry.path().ok()?.into_owned();
-            let filename = path.file_name()?.to_str()?.to_string();
-            let path = path.into_os_string().into_string().ok()?;
-            let path = path.strip_prefix("./").unwrap_or(&path).to_string();
-            let mime = mime_guess::from_path(&path).first_raw()?;
-            let mime = if mime.starts_with("text/") {
-                format!("{mime}; charset=utf-8")
-            } else {
-                mime.to_string()
-            };
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data).ok()?;
-            Some(Resource {
-                path,
-                filename,
-                mime,
-                data: ResourceData::Parts(vec![data]),
-            })
-        })
-        .collect())
-}
-
-pub async fn read_file(file: web_sys::File) -> Vec<u8> {
-    let file_size = file.size();
-    let partition_size = crate::erasure_coding::FILE_UPLOAD_READ_WINDOW_BYTES as f64;
-    if file_size > usize::MAX as f64 {
-        return vec![];
-    }
-
-    let mut content = Vec::with_capacity(file_size as usize);
-    let mut start = 0.0_f64;
-    while start < file_size {
-        let end = (start + partition_size).min(file_size);
-        let Ok(slice) = file.slice_with_f64_and_f64(start, end) else {
-            return vec![];
-        };
-        let Ok(buffer) = wasm_bindgen_futures::JsFuture::from(slice.array_buffer()).await else {
-            return vec![];
-        };
-        let bytes = js_sys::Uint8Array::new(&buffer);
-        let offset = content.len();
-        content.resize(offset + bytes.length() as usize, 0);
-        bytes.copy_to(&mut content[offset..]);
-        start = end;
-    }
-    content
-}
 
 pub const EMPTY_CHEQUEBOOK_ADDRESS: [u8; 20] = [0; 20];
 
@@ -376,7 +317,7 @@ pub fn parse_address(
     timestamp: i64,
     network_id: u64,
     chequebook_address: &[u8],
-) -> web3::types::Address {
+) -> alloy_primitives::Address {
     let sign_data = generate_sign_data(
         underlay,
         overlay,
@@ -408,7 +349,7 @@ mod hash_tests {
                 while level.len() > SECTION_SIZE {
                     level = level
                         .chunks_exact(SECTION2_SIZE)
-                        .flat_map(web3::signing::keccak256)
+                        .flat_map(|b| alloy_primitives::keccak256(b).0)
                         .collect();
                 }
                 assert_eq!(bmt_root(&data[..length]).unwrap().as_slice(), level);

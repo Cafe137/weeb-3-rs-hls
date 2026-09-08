@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use event_listener::Event;
 use futures::{FutureExt, StreamExt, future, stream};
-use wasm_bindgen_futures::spawn_local;
+use tokio::task::spawn_local;
 
 use super::{
     HLS_LIVE_BODY_RUNWAY_SEGMENTS, HLS_LIVE_EDGE_SEGMENTS, HLS_LIVE_STARTUP_BUFFER_SECONDS,
@@ -35,6 +35,24 @@ use crate::{
         route_markers, streaming_route_path,
     },
 };
+
+/// Native stand-in for `web_sys::Url::search_params()`: same `get -> Option<String>`
+/// shape so the call sites below are unchanged.
+struct QueryParams(std::collections::HashMap<String, String>);
+
+impl QueryParams {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+}
+
+fn query_params(url: &url::Url) -> QueryParams {
+    QueryParams(
+        url.query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect(),
+    )
+}
 
 const HLS_BODY_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const HLS_BODY_MAX_BYTES: u64 = 96 * 1024 * 1024;
@@ -1465,7 +1483,7 @@ pub(crate) fn install_live_tail_fallback(
             .iter()
             .map(|segment| segment.duration)
             .sum::<f64>();
-        let now = js_sys::Date::now();
+        let now = crate::runtime_conventions::Date::now();
         while active
             .tail_fallbacks
             .front()
@@ -1589,7 +1607,7 @@ fn spawn_follower(id: u64) {
         return;
     }
     spawn_local(async move {
-        let mut last_frontier_check = js_sys::Date::now();
+        let mut last_frontier_check = crate::runtime_conventions::Date::now();
         loop {
             let Some((client, owner, topic, head, _)) = feed_follow_context(id) else {
                 return;
@@ -1631,7 +1649,7 @@ fn spawn_follower(id: u64) {
                 }
             }
             if progressed {
-                last_frontier_check = js_sys::Date::now();
+                last_frontier_check = crate::runtime_conventions::Date::now();
                 continue;
             }
 
@@ -1640,7 +1658,7 @@ fn spawn_follower(id: u64) {
                 return;
             }
 
-            let now = js_sys::Date::now();
+            let now = crate::runtime_conventions::Date::now();
             if now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL {
                 last_frontier_check = now;
                 if recover_feed_frontier(id, &client, &owner, &topic).await {
@@ -1965,9 +1983,9 @@ pub(crate) async fn try_fetch_response(
     _stream_token: Option<&str>,
 ) -> Option<FetchResponse> {
     if let Some(reference) = canonical_hls_bytes_resource(pathname) {
-        let query = web_sys::Url::new(request_url)
+        let query = url::Url::parse(request_url)
             .ok()
-            .map(|url| url.search_params());
+            .map(|url| query_params(&url));
         let codec_bootstrap = query
             .as_ref()
             .and_then(|query| query.get("bootstrap"))
@@ -1990,11 +2008,11 @@ pub(crate) async fn try_fetch_response(
         });
     }
     let (owner, topic) = canonical_feed_resource(pathname)?;
-    let url = match web_sys::Url::new(request_url) {
+    let url = match url::Url::parse(request_url) {
         Ok(url) => url,
         Err(_) => return Some(FetchResponse::error(400, "invalid feed URL")),
     };
-    let query = url.search_params();
+    let query = query_params(&url);
     let index = match query.get("index") {
         Some(index) => match index.parse() {
             Ok(index) => Some(index),
@@ -2148,6 +2166,14 @@ pub(crate) async fn prepare_hls_feed(
         clear_hls_runtime_cache();
     }
     result
+}
+
+/// Live occupancy of the HLS body cache. Diagnostic only.
+pub(crate) fn body_cache_stats() -> (usize, u64) {
+    BODY_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        (cache.bodies.len(), cache.bytes)
+    })
 }
 
 pub(crate) fn release_hls_runtime() {

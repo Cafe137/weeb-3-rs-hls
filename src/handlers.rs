@@ -9,7 +9,7 @@ use libp2p::{
     swarm::ConnectionId,
 };
 
-use web3::types::{Address, U256};
+use alloy_primitives::{Address, U256};
 
 use crate::conventions::*;
 use crate::weeb_3::etiquette_0;
@@ -25,7 +25,6 @@ use crate::persistence::{
     get_chequebook_address, get_chequebook_last_issued_cheque_payout, get_chequebook_signer_key,
     set_chequebook_last_issued_cheque_payout,
 };
-use crate::{network_profile::active_profile, on_chain::ChequebookClient};
 
 use crate::HANDSHAKE_PROTOCOL;
 use crate::PSEUDOSETTLE_PROTOCOL;
@@ -105,18 +104,18 @@ async fn prepare_outgoing_cheque_state(
     let chequebook = Address::from_slice(&chequebook_bytes);
 
     let last_payout_bytes =
-        get_chequebook_last_issued_cheque_payout(chequebook.as_bytes(), beneficiary.as_bytes())
+        get_chequebook_last_issued_cheque_payout(chequebook.as_slice(), beneficiary.as_slice())
             .await;
     let stored_cumulative_payout = match last_payout_bytes.len() {
-        0 => U256::zero(),
-        1..=32 => U256::from_big_endian(&last_payout_bytes),
+        0 => U256::ZERO,
+        1..=32 => U256::from_be_slice(&last_payout_bytes),
         _ => return None,
     };
 
     let effective_deduction = if stored_cumulative_payout.is_zero() {
         deduction
     } else {
-        U256::zero()
+        U256::ZERO
     };
     let cheque_delta = U256::from(amount).checked_mul(price)?;
     let cumulative_payout = stored_cumulative_payout
@@ -181,16 +180,16 @@ async fn handshake_exchange(
         network_id,
         &peer_address.chequebook_address,
     );
-    if beneficiary == web3::types::Address::zero() {
+    if beneficiary == Address::ZERO {
         return None;
     }
     let peer_overlay = peer_address.overlay;
 
     let nonce: [u8; 32] = [0; 32];
-    let timestamp = (js_sys::Date::now() / 1000.0).floor() as i64;
+    let timestamp = (crate::runtime_conventions::Date::now() / 1000.0).floor() as i64;
     let chequebook_address = EMPTY_CHEQUEBOOK_ADDRESS.to_vec();
     let mut overlay_input = [0_u8; 60];
-    overlay_input[..20].copy_from_slice(signer.address().as_bytes());
+    overlay_input[..20].copy_from_slice(signer.address().as_slice());
     overlay_input[20..28].copy_from_slice(&network_id.to_le_bytes());
     overlay_input[28..].copy_from_slice(&nonce);
     let overlay = keccak256(overlay_input);
@@ -354,77 +353,17 @@ async fn refreshment_exchange(amount: u64, mut stream: Stream) -> RefreshmentOut
     RefreshmentOutcome::Acknowledged(acknowledged_amount)
 }
 
+/// Viewer scope holds no chequebook, so no cheque is ever issued. The stream is
+/// closed politely and the exchange reports failure.
 async fn cheque_exchange(
-    amount: u64,
+    _amount: u64,
     mut stream: Stream,
-    beneficiary: Address,
-    price: U256,
-    deduction: U256,
+    _beneficiary: Address,
+    _price: U256,
+    _deduction: U256,
 ) -> Option<()> {
-    let signer_key = get_chequebook_signer_key().await;
-    if signer_key.len() != 32 {
-        return None;
-    }
-
-    let wallet = PrivateKeySigner::from_slice(&signer_key).ok()?;
-    let cheque_state =
-        prepare_outgoing_cheque_state(beneficiary, amount, price, deduction).await?;
-
-    let mut buf = [0u8; 32];
-    price.to_big_endian(&mut buf);
-    let price_header = etiquette_0::Header {
-        key: "exchange".to_string(),
-        value: trimmed_big_endian(&buf),
-    };
-
-    let mut buf = [0u8; 32];
-    cheque_state.effective_deduction.to_big_endian(&mut buf);
-    let deduction_header = etiquette_0::Header {
-        key: "deduction".to_string(),
-        value: trimmed_big_endian(&buf),
-    };
-    let non_empty = etiquette_0::Headers {
-        headers: vec![price_header, deduction_header],
-    };
-
-    let buf_non_empty = non_empty.encode_length_delimited_to_vec();
-
-    stream.write_all(&buf_non_empty).await.ok()?;
-    let _ = stream.flush().await;
-
-    read_control_protocol_frame(&mut stream).await?;
-
-    let client = ChequebookClient::new(
-        cheque_state.chequebook,
-        wallet,
-        active_profile().wallet_chain_id,
-    );
-
-    let cheque_json =
-        client.prepare_emit_cheque_bytes(cheque_state.beneficiary, cheque_state.cumulative_payout)?;
-
-    let msg = etiquette_8::EmitCheque {
-        cheque: cheque_json,
-    };
-
-    let bufw = msg.encode_length_delimited_to_vec();
-
-    stream.write_all(&bufw).await.ok()?;
-
-    let _ = stream.flush().await;
-
-    let mut cumulative_payout_bytes = [0u8; 32];
-    cheque_state
-        .cumulative_payout
-        .to_big_endian(&mut cumulative_payout_bytes);
-    let saved = set_chequebook_last_issued_cheque_payout(
-        cheque_state.chequebook.as_bytes(),
-        cheque_state.beneficiary.as_bytes(),
-        &cumulative_payout_bytes,
-    )
-    .await;
     let _ = stream.close().await;
-    saved.then_some(())
+    None
 }
 
 async fn retrieval_exchange(chunk_address: Vec<u8>, mut stream: Stream) -> Option<Vec<u8>> {

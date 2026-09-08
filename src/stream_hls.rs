@@ -558,32 +558,9 @@ fn is_hex_reference(value: &str) -> bool {
     matches!(value.len(), 64 | 128) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[cfg(target_arch = "wasm32")]
-#[path = "stream_hls/player.rs"]
-mod player;
-
-#[cfg(target_arch = "wasm32")]
-#[path = "stream_hls/page_bridge.rs"]
-mod page_bridge;
-
-#[cfg(target_arch = "wasm32")]
-#[path = "stream_hls/protocol.rs"]
-mod protocol;
-
-#[cfg(target_arch = "wasm32")]
 #[path = "stream_hls/runtime.rs"]
-mod runtime;
+pub(crate) mod runtime;
 
-#[cfg(target_arch = "wasm32")]
-#[path = "stream_hls/worker_bridge.rs"]
-pub(crate) mod worker_bridge;
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) use page_bridge::{
-    attach_hls_feed_player, open_hls_feed_view, release_hls_for_bzz_view, release_hls_view,
-};
-
-#[cfg(target_arch = "wasm32")]
 pub(crate) use runtime::{
     clear_hls_runtime_cache, install_live_tail_fallback, live_tail_failure_identity,
     lock_live_startup_plan, prepare_hls_feed, release_hls_runtime, start_beginning_history,

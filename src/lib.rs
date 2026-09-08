@@ -1,18 +1,17 @@
-#![cfg(target_arch = "wasm32")]
 
 use async_lock::Semaphore;
 use async_std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use wasm_bindgen_futures::spawn_local;
+use tokio::task::spawn_local;
 
 pub(crate) use async_std::channel as mpsc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;
 use std::time::Duration;
 
-use web3::types::U256;
+use alloy_primitives::U256;
 
-use js_sys::Date;
+use crate::runtime_conventions::Date;
 use libp2p::{
     PeerId, StreamProtocol, Swarm,
     core::{self, Multiaddr, Transport},
@@ -25,11 +24,9 @@ use libp2p::{
     identity::ecdsa,
     noise,
     swarm::{ConnectionId, DialError, SwarmEvent},
-    websocket_websys, yamux,
+    dns, tcp, websocket, yamux,
 };
 pub(crate) use libp2p_stream::Control as StreamControl;
-use wasm_bindgen::JsValue;
-use web_sys::File;
 
 mod manifest;
 use manifest::acquire_bzz_collection;
@@ -68,35 +65,26 @@ use handlers::*;
 
 mod stream_hls;
 
-mod shared_runtime;
 
-mod worker_protocol;
 
-mod worker_runtime;
-pub use worker_runtime::Weeb3WorkerRuntime;
 
-mod interface;
 
-mod interface_conventions;
 
-mod library;
 
-mod manifest_upload;
 
 mod stream_conventions;
 
-mod on_chain;
-use on_chain::{chequebook_balance, get_price_from_oracle, web3};
 
-mod on_chain_conventions;
 
-mod nav;
 
 mod network_profile;
 use network_profile::{activate_profile, profile_for_swarm_network_id};
 
+
+mod stubs;
+use stubs::{get_price_from_oracle, resolve_ens_reference, secure_ensure_feed_owner, secure_vault};
+
 mod persistence;
-use persistence::{get_chequebook_address, get_chequebook_signer_key};
 
 mod retrieval;
 use retrieval::*;
@@ -107,18 +95,13 @@ pub(crate) use retrieval_conventions::{
     transfer_pause_enabled, wait_transfer_unpaused, wait_transfer_unpaused_for_admission,
 };
 
-mod secure_vault;
-use secure_vault::{secure_ensure_authorized, secure_ensure_feed_owner, secure_reset_stamp};
 
-mod wallet_workflows;
 
 mod stream;
 
-mod upload;
-use upload::*;
 
-mod ens;
-use ens::resolve_ens_reference;
+
+pub mod viewer;
 
 mod events;
 use events::{ProgressRow, ProgressStore};
@@ -188,8 +171,6 @@ pub(crate) struct Weeb3 {
     log_start_ms: f64,
     chunk_port: (ChunkRetrieveSender, ChunkRetrieveReceiver),
     range_port: AsyncPort<BzzRangeRequest>,
-    chunk_push_port: AsyncPort<ChunkUploadRequest>,
-    upload_port: AsyncPort<UploadRequest>,
     bootnode_port: AsyncPort<BootnodeChange>,
     network_id: Mutex<u64>,
     service_worker_network_id: AtomicUsize,
@@ -234,163 +215,6 @@ impl Weeb3 {
         }
 
         true
-    }
-
-    pub async fn post_upload_with_redundancy(
-        &self,
-        file: File,
-        encryption: bool,
-        redundancy_level: erasure_coding::RedundancyLevel,
-        index_string: String,
-        add_to_feed: bool,
-        feed_topic: String,
-    ) -> Vec<u8> {
-        let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
-        let (progress_out, progress_in) = mpsc::unbounded::<UploadProgressDelta>();
-
-        let f_size = file.size();
-        let f_name = file.name();
-        let progress_id = self
-            .start_progress("upload", f_name.clone(), "read", Some(0), "reading input")
-            .await;
-        spawn_upload_progress_listener(self.progress.clone(), progress_id.clone(), progress_in);
-        let f_type0 = file.type_();
-        let f_type = if f_type0.starts_with("text/") {
-            f_type0 + "; charset=utf-8"
-        } else {
-            f_type0
-        };
-
-        let mut fvec0 = Vec::new();
-
-        let mut index_document = "".to_string();
-
-        if f_type == "application/x-tar" || f_type == "application/tar" {
-            index_document = match index_string.is_empty() {
-                true => "index.html".to_string(),
-                false => index_string,
-            };
-
-            let content = read_file(file).await;
-            if content.is_empty() && f_size > 0.0 {
-                self.finish_progress(&progress_id, "failed", "file read failed", false)
-                    .await;
-                return upload_result("upload result: failed to read file", "");
-            }
-
-            self.update_progress(&progress_id, "parse", Some(20), "reading tar archive")
-                .await;
-
-            fvec0 = match tar_resources(&content) {
-                Ok(resources) => resources,
-                Err(_) => {
-                    self.finish_progress(&progress_id, "failed", "invalid tar archive", false)
-                        .await;
-                    return upload_result("upload result: invalid tar archive", "");
-                }
-            };
-        } else {
-            fvec0.push(Resource {
-                path: f_name.clone(),
-                filename: f_name,
-                mime: f_type,
-                data: ResourceData::BrowserFile(file),
-            });
-        }
-
-        if fvec0.is_empty() {
-            self.finish_progress(&progress_id, "failed", "no uploadable files", false)
-                .await;
-            return upload_result("upload result: no uploadable files", "");
-        }
-
-        let topic_safe = normalize_feed_topic(&feed_topic);
-
-        self.update_progress(&progress_id, "push", None, "upload queued")
-            .await;
-
-        if self
-            .upload_port
-            .0
-            .try_send((
-                fvec0,
-                encryption,
-                redundancy_level,
-                index_document,
-                add_to_feed,
-                topic_safe,
-                Some(progress_out),
-                chan_out,
-            ))
-            .is_err()
-        {
-            self.finish_progress(&progress_id, "failed", "upload queue unavailable", false)
-                .await;
-            return upload_result("upload result: upload queue unavailable", "");
-        }
-
-        let result = chan_in.recv().await.unwrap_or_default();
-
-        if result.is_empty() {
-            self.finish_progress(&progress_id, "failed", "upload failed", false)
-                .await;
-            return upload_result("upload result: failure", "");
-        }
-
-        let reference_hex = hex::encode(&result);
-        self.finish_progress(
-            &progress_id,
-            "complete",
-            format!("reference {}", reference_hex),
-            true,
-        )
-        .await;
-
-        upload_result(
-            &format!(
-                "upload result: returned address displayed here: {}",
-                reference_hex
-            ),
-            &reference_hex,
-        )
-    }
-
-    pub async fn post_push_chunk(
-        &self,
-        d: Vec<u8>,
-        soc: bool,
-        chunk_address: Vec<u8>,
-        stamp: Vec<u8>,
-    ) -> Vec<u8> {
-        let (chan_out, chan_in) = mpsc::bounded::<bool>(1);
-        let (slot_chan_out, _slot_chan_in) = mpsc::bounded::<bool>(1);
-
-        let result_reference = hex::encode(&chunk_address);
-
-        let _ = self.chunk_push_port.0.try_send((
-            d,
-            soc,
-            chunk_address,
-            stamp,
-            chan_out,
-            slot_chan_out,
-            None,
-        ));
-
-        let result = chan_in.recv().await.unwrap_or(false);
-        let (message, filename) = if result {
-            ("Upload result: success", "Upload result")
-        } else {
-            ("Upload result: failure", "... result ...")
-        };
-        encode_resources(
-            vec![(
-                message.as_bytes().to_vec(),
-                "text/plain".to_string(),
-                filename.to_string(),
-            )],
-            result_reference,
-        )
     }
 
     pub async fn acquire(&self, address: String) -> Vec<u8> {
@@ -483,17 +307,6 @@ impl Weeb3 {
         bytes
     }
 
-    pub async fn reset_stamp(&self) -> Vec<u8> {
-        let reset = secure_reset_stamp().await;
-        let message = if reset {
-            "Stamp reset and ready to be reused. Uploads after this point will overwrite uploads from before this point."
-        } else {
-            "Secure stamp reset failed. Open the weeb-3-secure vault and try again."
-        };
-
-        upload_result(message, "... result ...")
-    }
-
     pub fn new() -> Weeb3 {
         let secret_key = ecdsa::SecretKey::generate();
         let handshake_signer =
@@ -501,20 +314,35 @@ impl Weeb3 {
         let keypair: ecdsa::Keypair = secret_key.into();
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.into())
-            .with_wasm_bindgen()
+            .with_tokio()
             .with_other_transport(|key| {
-                websocket_websys::Transport::default()
+                // Swarm bootnodes are published as /dns4/../tcp/../tls/ws/.. so the
+                // viewer needs WebSocket-over-TLS as well as plain TCP; DNS wraps both
+                // because the addresses are /dns4/, not /ip4/.
+                let websocket_transport = websocket::Config::new(
+                    dns::tokio::Transport::system(tcp::tokio::Transport::new(
+                        tcp::Config::default().nodelay(true),
+                    ))
+                    .expect("system DNS resolver"),
+                );
+                let tcp_transport = dns::tokio::Transport::system(tcp::tokio::Transport::new(
+                    tcp::Config::default().nodelay(true),
+                ))
+                .expect("system DNS resolver");
+
+                websocket_transport
+                    .or_transport(tcp_transport)
                     .upgrade(core::upgrade::Version::V1Lazy)
                     .authenticate(noise::Config::new(key).unwrap())
                     .multiplex(yamux::Config::default())
                     .outbound_timeout(Duration::from_millis(OUTBOUND_CONNECTION_TIMEOUT_MS))
                     .boxed()
             })
-            .expect("Failed to create WebSocket transport")
+            .expect("Failed to create transport")
             .with_behaviour(|key| Behaviour::new(key.public()))
             .unwrap()
             .with_swarm_config(|_| {
-                libp2p::swarm::Config::with_wasm_executor()
+                libp2p::swarm::Config::with_tokio_executor()
                     .with_idle_connection_timeout(Duration::from_secs(36000000))
                     .with_substream_upgrade_protocol_override(core::upgrade::Version::V1Lazy)
                     .with_max_negotiating_inbound_streams(10_000)
@@ -531,8 +359,6 @@ impl Weeb3 {
             log_start_ms: Date::now(),
             chunk_port: chunk_retrieve_channel(),
             range_port: mpsc::bounded(RANGE_REQUEST_QUEUE_CAPACITY),
-            upload_port: mpsc::unbounded(),
-            chunk_push_port: mpsc::unbounded(),
             bootnode_port: mpsc::unbounded(),
             network_id: Mutex::new(1),
             service_worker_network_id: AtomicUsize::new(1),
@@ -605,8 +431,6 @@ impl Weeb3 {
             mpsc::unbounded::<RefreshmentInstruction>();
 
         let chunk_retrieve_chan_outgoing = self.chunk_port.0.clone();
-
-        let chunk_upload_chan_outgoing = self.chunk_push_port.0.clone();
 
         let (cheque_instructions_chan_outgoing, cheque_instructions_chan_incoming) =
             mpsc::unbounded::<(PeerId, u64, u64)>();
@@ -1957,167 +1781,6 @@ impl Weeb3 {
             }
         };
 
-        let push_handle = async {
-            while let Ok(incoming_request) = self.upload_port.1.recv().await {
-                for incoming_request in std::iter::once(incoming_request)
-                    .chain(std::iter::from_fn(|| self.upload_port.1.try_recv().ok()))
-                {
-                    let (file0, enc, redundancy_level, index, feed, topic, progress, chan) =
-                        incoming_request;
-
-                    if !secure_ensure_authorized().await {
-                        self.interface_log(
-                            "Could not authorize weeb-3-secure for upload signing".to_string(),
-                        );
-                        let _ = chan.try_send(vec![]);
-                    } else {
-                        let push_reference = upload_resource(
-                            file0,
-                            enc,
-                            redundancy_level,
-                            index,
-                            "404.html".to_string(),
-                            feed,
-                            topic,
-                            &chunk_upload_chan_outgoing,
-                            &chunk_retrieve_chan_outgoing,
-                            progress,
-                        )
-                        .await;
-                        let _ = chan.try_send(push_reference);
-                    }
-                }
-
-                async_std::task::yield_now().await;
-            }
-        };
-
-        let push_chunk_handle = async {
-            let push_sem = Arc::new(Semaphore::new(PUSH_CHUNK_CONCURRENCY));
-
-            while let Ok(incoming_request) = self.chunk_push_port.1.recv().await {
-                for incoming_request in
-                    std::iter::once(incoming_request).chain(std::iter::from_fn(|| {
-                        self.chunk_push_port.1.try_recv().ok()
-                    }))
-                {
-                    let (d, soc, checkad, stamp, feedback, slot_feedback, progress) =
-                        incoming_request;
-
-                    if feedback.is_closed() {
-                        let _ = slot_feedback.try_send(true);
-                        continue;
-                    }
-
-                    wait_transfer_unpaused(&self.transfer_paused).await;
-
-                    let Some(permit) = push_sem.try_acquire_arc() else {
-                        async_std::task::sleep(Duration::from_millis(PUSH_CHUNK_QUEUE_BACKOFF_MS))
-                            .await;
-                        if !feedback.is_closed() {
-                            let _ = chunk_upload_chan_outgoing.try_send((
-                                d,
-                                soc,
-                                checkad,
-                                stamp,
-                                feedback,
-                                slot_feedback,
-                                progress,
-                            ));
-                        } else {
-                            let _ = slot_feedback.try_send(true);
-                        }
-                        break;
-                    };
-
-                    if feedback.is_closed() {
-                        let _ = slot_feedback.try_send(true);
-                        drop(permit);
-                        continue;
-                    }
-
-                    let upload_control = upload_control.clone();
-                    let wings = wings.clone();
-                    let refreshment = refreshment_instructions_chan_outgoing.clone();
-                    let chunk_upload_chan_outgoing = chunk_upload_chan_outgoing.clone();
-                    let log_port = self.log_port.0.clone();
-                    let log_start_ms = self.log_start_ms;
-                    let transfer_paused = self.transfer_paused.clone();
-                    spawn_local(async move {
-                        wait_transfer_unpaused(&transfer_paused).await;
-                        let address = {
-                            let _permit = permit;
-                            push_chunk(
-                                d.clone(),
-                                soc,
-                                checkad.clone(),
-                                stamp.clone(),
-                                upload_control.clone(),
-                                &wings.overlay_peers,
-                                &wings.accounting_peers,
-                                &wings.physical_connections,
-                                &refreshment,
-                                Some(transfer_paused.clone()),
-                            )
-                            .await
-                        };
-                        let _ = slot_feedback.try_send(true);
-
-                        let chunk = if !address.is_empty() {
-                            wait_transfer_unpaused(&transfer_paused).await;
-                            retrieve_check_chunk(
-                                &checkad,
-                                upload_control.clone(),
-                                &wings.overlay_peers,
-                                &wings.accounting_peers,
-                                &wings.physical_connections,
-                                &refreshment,
-                                Some(transfer_paused.clone()),
-                            )
-                            .await
-                        } else {
-                            vec![]
-                        };
-
-                        if chunk.is_empty() {
-                            if !address.is_empty() {
-                                interface_log_to(
-                                    &log_port,
-                                    log_start_ms,
-                                    format!(
-                                        "Retrieve check failed for chunk {}",
-                                        hex::encode(&checkad)
-                                    ),
-                                );
-                            }
-                            if !feedback.is_closed() {
-                                async_std::task::sleep(Duration::from_millis(
-                                    PUSH_CHUNK_RETRY_DELAY_MS,
-                                ))
-                                .await;
-                                if !feedback.is_closed() {
-                                    let _ = chunk_upload_chan_outgoing.try_send((
-                                        d.clone(),
-                                        soc,
-                                        checkad.clone(),
-                                        stamp.clone(),
-                                        feedback.clone(),
-                                        slot_feedback.clone(),
-                                        progress.clone(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            report_upload_progress(&progress, 0, 1);
-                            let _ = feedback.try_send(true);
-                        }
-                    });
-                }
-
-                async_std::task::yield_now().await;
-            }
-        };
-
         let retrieve_chunk_handle = async {
             let retrieve_sem = Arc::new(Semaphore::new(RETRIEVE_CHUNK_CONCURRENCY));
             let retrieve_dispatch_yield_every = 128usize;
@@ -2397,8 +2060,6 @@ impl Weeb3 {
             cheque_apply_handle,
             acquire_range_handle,
             retrieve_chunk_handle,
-            push_handle,
-            push_chunk_handle,
             peer_dial_scheduler,
             swarm_event_loop,
             bootnode_change_handle,

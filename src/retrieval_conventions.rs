@@ -477,6 +477,13 @@ pub(crate) struct SingleflightRegistry<K, W, A> {
     flights: HashMap<K, SingleflightEntry<W, A>>,
 }
 
+impl<K, W, A> SingleflightRegistry<K, W, A> {
+    /// Flights still registered. Diagnostic only.
+    pub(crate) fn flight_count(&self) -> usize {
+        self.flights.len()
+    }
+}
+
 struct SingleflightEntry<W, A> {
     flight_id: u64,
     shared: A,

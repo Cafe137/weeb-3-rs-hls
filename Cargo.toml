@@ -2,42 +2,28 @@
 name = "weeb_3"
 version = "0.0.0"
 edition = "2024"
-description = "A Swarm client for browsers"
+description = "Standalone Swarm HLS viewer (native port of weeb-3)"
 license = "MIT"
-repository = "https://github.com/lat-murmeldjur/weeb-3"
-homepage = "https://github.com/lat-murmeldjur/weeb-3#readme"
 
 [[bin]]
-name = "weebery"
+name = "weeb-3-rs-hls"
 path = "src/main.rs"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["rlib"]
 
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1
-panic = "abort"
-strip = "symbols"
-
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O", "--all-features"]
 
 [build-dependencies]
 prost-build = "0.14.4"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-axum = { git = "https://github.com/tokio-rs/axum.git", default-features = false, features = ["original-uri"] }
-axum-server = { git = "https://github.com/programatik29/axum-server.git", features = ["tls-rustls-no-provider"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rust-embed = { version = "8.7.1", features = ["compression", "include-exclude"] }
-tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt"] }
-tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[dependencies]
 alloy-primitives = { git = "https://github.com/alloy-rs/core.git", default-features = false, features = ["std", "k256"] }
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std"] }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
+async-lock = "3.4.2"
 bytes = "1.12"
 event-listener = "5.4.1"
 futures = "0.3.33"
@@ -47,74 +33,28 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [
     "macros",
     "noise",
     "ping",
-    "websocket-websys",
     "yamux",
+    "tcp",
+    "dns",
+    "websocket",
+    "tokio",
 ] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
 prost = "0.14.4"
 rand = "0.8"
 serde_json = "1"
-wasm-bindgen = "0.2.100"
-wasm-bindgen-futures = "0.4.50"
-js-sys = { version = "0.3.77" }
-web-sys = { version = "0.3.77", features = [
-  'console',
-  'Blob',
-  'BlobPropertyBag',
-  'Document',
-  'DocumentFragment',
-  'Element',
-  'Event',
-  'EventTarget',
-  'File',
-  'FileList',
-  'FilePropertyBag',
-  'History',
-  'HtmlButtonElement',
-  'HtmlElement',
-  'HtmlInputElement',
-  'HtmlMediaElement',
-  'HtmlSpanElement',
-  'HtmlSelectElement',
-  'Location',
-  'MediaQueryList',
-  'MessagePort',
-  'MessageChannel',
-  'Navigator',
-  'Node',
-  'ServiceWorker',
-  'ServiceWorkerContainer',
-  'ServiceWorkerRegistration',
-  'SharedWorker',
-  'WorkerOptions',
-  'WorkerType',
-  'RegistrationOptions',
-  'TimeRanges',
-  'Url',
-  'UrlSearchParams',
-  'Window',
-] }
 hex = "0.4.3"
-web3 = { git = "https://github.com/tomusdrw/rust-web3.git", default-features = false, features = ["eip-1193", "http"] }
+base64 = "0.22.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 tar = { git = "https://github.com/alexcrichton/tar-rs.git" }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git", default-features = false }
-indexed_db_futures = { git = "https://github.com/Alorel/rust-indexed-db.git" }
-base64 = "0.22.1"
-async-lock = "3.4.2"
-
-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "0.3.50"
+percent-encoding = "2"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
-async-std = { git = "https://github.com/async-rs/async-std.git" }
-async-lock = "3.4.2"
-bytes = "1.12"
-event-listener = "5.4.1"
-futures = "0.3.33"
-headless_chrome = "1.0.21"
-hex = "0.4.3"
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
-anyhow_crates_io = { package = "anyhow", version = "1" }
+anyhow = "1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
-sha3_crates_io = { package = "sha3", version = "0.10.9" }

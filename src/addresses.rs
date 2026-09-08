@@ -1,4 +1,3 @@
-#![cfg(target_arch = "wasm32")]
 
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use std::{convert::TryFrom, net::Ipv4Addr};

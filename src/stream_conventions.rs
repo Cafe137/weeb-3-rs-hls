@@ -19,7 +19,6 @@ pub(crate) fn streaming_route_path(suffix: &str) -> String {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) fn route_markers(kind: &str) -> Vec<String> {
     ["", "mainnet/", "testnet/"]
         .into_iter()
@@ -27,12 +26,11 @@ pub(crate) fn route_markers(kind: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) fn decode_component(value: &str) -> String {
-    js_sys::decode_uri_component(value)
-        .ok()
-        .and_then(|value| value.as_string())
-        .unwrap_or_else(|| value.to_string())
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

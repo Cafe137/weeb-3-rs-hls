@@ -44,22 +44,16 @@ pub(crate) fn bee_reconnect_delay_seconds(
         / bee_refresh_rate
 }
 
-#[cfg(target_arch = "wasm32")]
 use crate::{conventions::PeerAccounting, mpsc};
-#[cfg(target_arch = "wasm32")]
 use async_std::sync::{Arc, Mutex};
-#[cfg(target_arch = "wasm32")]
 use libp2p::{PeerId, swarm::ConnectionId};
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) type RefreshmentInstruction = (PeerId, Arc<Mutex<PeerAccounting>>, ConnectionId);
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) async fn set_payment_threshold(accounting: &Mutex<PeerAccounting>, amount: u64) {
     accounting.lock().await.threshold = amount;
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) async fn reserve(
     accounting: &Mutex<PeerAccounting>,
     amount: u64,
@@ -74,7 +68,6 @@ pub(crate) async fn reserve(
     Some(connection_id)
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) async fn apply_credit(
     accounting: &Arc<Mutex<PeerAccounting>>,
     amount: u64,
@@ -113,7 +106,6 @@ pub(crate) async fn apply_credit(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) async fn apply_refreshment(
     accounting: &Mutex<PeerAccounting>,
     amount: u64,
@@ -132,7 +124,6 @@ pub(crate) async fn apply_refreshment(
     None
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = accounting.lock().await;
     account.reserve = account.reserve.saturating_sub(amount);
@@ -143,7 +134,6 @@ pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) fn price(proximity: u8) -> u64 {
     (u64::from(crate::conventions::MAX_PO.saturating_sub(proximity)) + 1) * PO_PRICE
 }

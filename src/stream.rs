@@ -7,21 +7,16 @@ use std::{
 
 use async_std::sync::Arc;
 use bytes::Bytes;
-use js_sys::{Array, Object, Reflect};
 use libp2p::futures::future::join_all;
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
-use wasm_bindgen_futures::spawn_local;
-use web_sys::{Element, HtmlMediaElement};
+use tokio::task::spawn_local;
 
 use crate::{
     Weeb3,
     bzz_stream::{BzzMetadata, canonical_bzz_url},
-    interface::service_worker_controls_bzz_requests,
     mpsc,
     retrieval_conventions::{
         PendingGenerationRelation, next_nonzero_generation, pending_generation_relation,
     },
-    shared_runtime::SharedNodeClient,
     stream_conventions::{
         MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL, MEDIA_STARTUP_RESPONSE_BYTES,
         MEDIA_STORAGE_WINDOW_BYTES, MIB_BYTES, decode_component, if_none_match_matches,
@@ -29,8 +24,11 @@ use crate::{
         media_cache_budget_bytes, media_prefetch_ahead_limit_bytes, media_prefetch_stage_targets,
         parse_single_range, window_key,
     },
-    worker_protocol::{bytes_to_js, set as set_js, string_property},
 };
+
+fn is_streamable_mime(mime: &str) -> bool {
+    mime.starts_with("video/") || mime.starts_with("audio/")
+}
 
 const STREAM_RESPONSE_BUFFER_BYTES: u64 = MEDIA_STARTUP_RESPONSE_BYTES;
 const STREAM_ACTIVE_RESPONSE_BUFFER_BYTES: u64 = 2 * MIB_BYTES;
@@ -52,8 +50,14 @@ thread_local! {
     static FETCH_CACHE: RefCell<FetchCache> = RefCell::new(FetchCache::default());
     static AUXILIARY_MEDIA_CACHE_BYTES: Cell<u64> = const { Cell::new(0) };
     static MEDIA_CACHE_BUDGET_BYTES: u64 = detect_media_cache_max_bytes();
-    static MEDIA_ELEMENT_CALLBACKS: RefCell<Vec<MediaElementCallback>> =
-        const { RefCell::new(Vec::new()) };
+}
+
+/// Live occupancy of the media fetch cache. Diagnostic only.
+pub(crate) fn fetch_cache_stats() -> (usize, usize, u64) {
+    FETCH_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        (cache.metadata.len(), cache.ranges.len(), cache.range_bytes)
+    })
 }
 
 /// Reserve the result view without cancelling already-dispatched work.
@@ -67,32 +71,6 @@ pub(crate) fn begin_result_view_request() -> u64 {
 
 pub(crate) fn result_view_request_is_current(expected: u64) -> bool {
     RESULT_VIEW_GENERATION.with(|generation| generation.get() == expected)
-}
-
-struct MediaElementCallback {
-    target: Element,
-    event_names: &'static [&'static str],
-    callback: Closure<dyn FnMut()>,
-}
-
-#[derive(Default)]
-struct MediaRetryState {
-    errored: bool,
-    retrying: bool,
-    scheduled: bool,
-    attempt: usize,
-    playback_time: Option<f64>,
-}
-
-impl Drop for MediaElementCallback {
-    fn drop(&mut self) {
-        for event_name in self.event_names {
-            let _ = self.target.remove_event_listener_with_callback(
-                event_name,
-                self.callback.as_ref().unchecked_ref(),
-            );
-        }
-    }
 }
 
 pub(crate) fn next_media_generation() -> u64 {
@@ -359,24 +337,10 @@ impl From<&str> for RangeReadError {
 }
 
 fn detect_media_cache_max_bytes() -> u64 {
-    let mut js_heap_size_limit = None;
-    let global = js_sys::global();
-    if let Ok(performance) = Reflect::get(&global, &"performance".into())
-        && let Ok(memory) = Reflect::get(&performance, &"memory".into())
-        && let Ok(limit) = Reflect::get(&memory, &"jsHeapSizeLimit".into())
-    {
-        js_heap_size_limit = limit.as_f64();
-    }
-
-    let mut device_memory_gib = None;
-    if let Some(window) = web_sys::window() {
-        let navigator = window.navigator();
-        if let Ok(device_memory) = Reflect::get(navigator.as_ref(), &"deviceMemory".into()) {
-            device_memory_gib = device_memory.as_f64();
-        }
-    }
-
-    media_cache_budget_bytes(js_heap_size_limit, device_memory_gib)
+    // The browser sized this from `performance.memory.jsHeapSizeLimit` and
+    // `navigator.deviceMemory`. Natively neither exists; a viewer wants a small,
+    // predictable cache anyway, so take the library default.
+    media_cache_budget_bytes(None, None)
 }
 
 pub(crate) fn media_cache_max_bytes() -> u64 {
@@ -420,7 +384,7 @@ impl MediaState {
             last_request_start: 0,
             prefetch_running: false,
             prefetch_generation: 0,
-            last_touch: js_sys::Date::now(),
+            last_touch: crate::runtime_conventions::Date::now(),
         }
     }
 
@@ -436,7 +400,7 @@ impl MediaState {
 
     fn mark_scheduled(&mut self, end: u64) {
         self.scheduled_high_water_end = self.scheduled_high_water_end.max(end as i64);
-        self.last_touch = js_sys::Date::now();
+        self.last_touch = crate::runtime_conventions::Date::now();
     }
 
     fn mark_complete(&mut self, start: u64, end: u64) {
@@ -449,14 +413,14 @@ impl MediaState {
                 break;
             }
         }
-        self.last_touch = js_sys::Date::now();
+        self.last_touch = crate::runtime_conventions::Date::now();
     }
 
     fn mark_failure(&mut self, start: u64) {
         let failure_end = if start == 0 { -1 } else { start as i64 - 1 };
         self.scheduled_high_water_end = self.scheduled_high_water_end.min(failure_end);
         self.scheduled_high_water_end = self.scheduled_high_water_end.max(self.high_water_end);
-        self.last_touch = js_sys::Date::now();
+        self.last_touch = crate::runtime_conventions::Date::now();
     }
 }
 
@@ -517,63 +481,9 @@ impl FetchResponse {
         }
     }
 
-    fn into_js(self) -> Object {
-        let resp = Object::new();
-        set_js(&resp, "ok", JsValue::from_bool(self.ok));
-        set_js(&resp, "status", JsValue::from_f64(self.status as f64));
-        set_js(&resp, "error", JsValue::from_str(&self.error));
-        set_js(&resp, "stream", JsValue::from_bool(self.stream));
-
-        let headers = Array::new();
-        for (name, value) in self.headers {
-            let pair = Array::new();
-            pair.push(&name.into());
-            pair.push(&value.into());
-            headers.push(&pair);
-        }
-        set_js(&resp, "headers", headers.into());
-
-        if let Some(body) = self.body {
-            set_js(&resp, "body", bytes_to_js(&body).into());
-        }
-
-        resp
-    }
 }
 
 /// SharedWorker equivalent of the page message bridge.
-pub(crate) async fn service_worker_message_response(
-    obj: &js_sys::Object,
-    weeb3: Arc<Weeb3>,
-) -> Option<Object> {
-    if string_property(obj.as_ref(), "type").as_deref() != Some("WEEB3_FETCH_REQUEST") {
-        return None;
-    }
-    let url = string_property(obj.as_ref(), "url").unwrap_or_default();
-    let mut method = string_property(obj.as_ref(), "method").unwrap_or_else(|| "GET".into());
-    method.make_ascii_uppercase();
-    let range = string_property(obj.as_ref(), "range").filter(|value| !value.is_empty());
-    let if_none_match =
-        string_property(obj.as_ref(), "ifNoneMatch").filter(|value| !value.trim().is_empty());
-    let if_range =
-        string_property(obj.as_ref(), "ifRange").filter(|value| !value.trim().is_empty());
-    let stream_token =
-        string_property(obj.as_ref(), "streamToken").filter(|value| !value.trim().is_empty());
-    Some(
-        fetch_request_response(
-            weeb3,
-            url,
-            method,
-            range,
-            if_none_match,
-            if_range,
-            stream_token,
-        )
-        .await
-        .into_js(),
-    )
-}
-
 async fn fetch_request_response(
     weeb3: Arc<Weeb3>,
     url: String,
@@ -587,9 +497,9 @@ async fn fetch_request_response(
         return FetchResponse::error(405, "method not allowed");
     }
 
-    let parsed_url = web_sys::Url::new(&url).ok();
+    let parsed_url = url::Url::parse(&url).ok();
     let pathname = match &parsed_url {
-        Some(url) => url.pathname(),
+        Some(url) => url.path().to_string(),
         None => url.clone(),
     };
 
@@ -951,7 +861,7 @@ fn begin_media_range(resource: &str, metadata: &BzzMetadata, start: u64) -> Medi
         }
 
         state.last_request_start = start;
-        state.last_touch = js_sys::Date::now();
+        state.last_touch = crate::runtime_conventions::Date::now();
 
         MediaRangeState {
             generation: state.generation,
@@ -1556,89 +1466,6 @@ fn route_resource<'a>(pathname: &'a str, route: &str) -> Option<&'a str> {
     path.strip_prefix(route)
 }
 
-pub async fn try_render_streaming_player(
-    weeb3: Rc<SharedNodeClient>,
-    resource: String,
-    metadata: BzzMetadata,
-    view_generation: u64,
-) -> bool {
-    if !is_streamable_mime(&metadata.mime) {
-        return false;
-    }
-    if !result_view_request_is_current(view_generation) {
-        return true;
-    }
-
-    let Some(src) = canonical_bzz_url(&resource, &metadata.path, None) else {
-        return false;
-    };
-
-    if !service_worker_controls_bzz_requests(&weeb3, "stream requests", || {
-        result_view_request_is_current(view_generation)
-    })
-    .await
-    {
-        if !result_view_request_is_current(view_generation) {
-            return true;
-        }
-        navigate_to_bzz_url(&src);
-        return true;
-    }
-    if !result_view_request_is_current(view_generation) {
-        return true;
-    }
-
-    let player = create_streaming_player(&metadata.mime, &src);
-    if !replace_bzz_result_view(&weeb3, &player, view_generation) {
-        return true;
-    }
-    let retry_state = Rc::new(RefCell::new(MediaRetryState::default()));
-    install_playback_state_reset(&player, retry_state.clone());
-    install_play_retries(&player, retry_state);
-    start_streaming_player(&player);
-    true
-}
-
-fn is_streamable_mime(mime: &str) -> bool {
-    mime.starts_with("video/") || mime.starts_with("audio/")
-}
-
-pub(crate) fn replace_stream_result_view(new_element: &Element, view_generation: u64) -> bool {
-    if !result_view_request_is_current(view_generation) {
-        return false;
-    }
-    replace_result_view_contents(new_element);
-    true
-}
-
-fn replace_bzz_result_view(
-    weeb3: &SharedNodeClient,
-    new_element: &Element,
-    view_generation: u64,
-) -> bool {
-    if !result_view_request_is_current(view_generation) {
-        return false;
-    }
-    crate::stream_hls::release_hls_for_bzz_view(weeb3);
-    release_bzz_view();
-    replace_result_view_dom(new_element);
-    true
-}
-
-pub(crate) fn replace_result_view_contents(new_element: &Element) {
-    release_current_stream_view();
-    replace_result_view_dom(new_element);
-}
-
-fn replace_result_view_dom(new_element: &Element) {
-    crate::interface::replace_result_view(new_element);
-}
-
-pub(crate) fn release_current_stream_view() {
-    crate::stream_hls::release_hls_view();
-    release_bzz_view();
-}
-
 pub(crate) fn set_auxiliary_media_cache_bytes(bytes: u64) {
     AUXILIARY_MEDIA_CACHE_BYTES.with(|current| current.set(bytes));
     FETCH_CACHE.with(|cache| cache.borrow_mut().trim_ranges());
@@ -1648,209 +1475,3 @@ pub(crate) fn clear_completed_media_ranges() {
     FETCH_CACHE.with(|cache| cache.borrow_mut().clear_completed_ranges());
 }
 
-fn release_bzz_view() {
-    MEDIA_ELEMENT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
-}
-
-fn create_streaming_player(mime: &str, src: &str) -> Element {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let is_video = mime.starts_with("video/");
-    let tag = if is_video { "video" } else { "audio" };
-    let player = document
-        .create_element(tag)
-        .unwrap()
-        .dyn_into::<HtmlMediaElement>()
-        .unwrap();
-
-    let _ = player.set_attribute("controls", "");
-    let _ = player.set_attribute("preload", "metadata");
-    if is_video {
-        let _ = player.set_attribute("playsinline", "");
-    }
-    player.set_muted(false);
-    player.set_default_muted(false);
-    player.set_volume(1.0);
-    player.set_autoplay(true);
-    player.set_src(src);
-    let _ = player.set_attribute("style", "width:90%;max-height:75vh;");
-
-    player.into()
-}
-
-fn start_streaming_player(player: &Element) {
-    if let Some(player) = player.dyn_ref::<HtmlMediaElement>() {
-        let _ = player.play();
-    }
-}
-
-fn retain_media_element_callback(
-    target: &Element,
-    event_names: &'static [&'static str],
-    callback: Closure<dyn FnMut()>,
-) {
-    for event_name in event_names {
-        let _ =
-            target.add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
-    }
-    MEDIA_ELEMENT_CALLBACKS.with(|callbacks| {
-        callbacks.borrow_mut().push(MediaElementCallback {
-            target: target.clone(),
-            event_names,
-            callback,
-        });
-    });
-}
-
-fn install_playback_state_reset(player: &Element, retry_state: Rc<RefCell<MediaRetryState>>) {
-    let callback = Closure::<dyn FnMut()>::new(move || {
-        *retry_state.borrow_mut() = MediaRetryState::default();
-    });
-
-    retain_media_element_callback(player, &["playing"], callback);
-}
-
-fn install_play_retries(player: &Element, retry_state: Rc<RefCell<MediaRetryState>>) {
-    let player_for_callback = player.clone();
-    let ready_retry_state = retry_state.clone();
-    let callback = Closure::<dyn FnMut()>::new(move || {
-        if !ready_retry_state.borrow().retrying {
-            return;
-        }
-        apply_media_retry_time(&player_for_callback, &ready_retry_state);
-        start_streaming_player(&player_for_callback);
-    });
-    retain_media_element_callback(
-        player,
-        &["loadedmetadata", "loadeddata", "canplay"],
-        callback,
-    );
-
-    {
-        let player_for_callback = player.clone();
-        let retry_state = retry_state.clone();
-        let callback = Closure::<dyn FnMut()>::new(move || {
-            {
-                let mut state = retry_state.borrow_mut();
-                state.errored = true;
-                state.retrying = false;
-            }
-            schedule_media_retry(player_for_callback.clone(), retry_state.clone());
-        });
-        retain_media_element_callback(player, &["error"], callback);
-    }
-
-    let player_for_callback = player.clone();
-    let callback = Closure::<dyn FnMut()>::new(move || {
-        if !retry_state.borrow().errored {
-            return;
-        }
-
-        remember_media_retry_time(&player_for_callback, &retry_state);
-        if retry_state.borrow().retrying {
-            return;
-        }
-
-        start_media_retry(&player_for_callback, false, &retry_state);
-    });
-    retain_media_element_callback(
-        player,
-        &[
-            "play",
-            "seeking",
-            "seeked",
-            "click",
-            "pointerdown",
-            "mousedown",
-            "touchstart",
-            "keydown",
-        ],
-        callback,
-    );
-}
-
-fn schedule_media_retry(player: Element, retry_state: Rc<RefCell<MediaRetryState>>) {
-    if !player.is_connected() {
-        return;
-    }
-    let delay_ms = {
-        let mut state = retry_state.borrow_mut();
-        if !state.errored || state.scheduled {
-            return;
-        }
-        let Some(delay_ms) = MEDIA_RETRY_DELAYS_MS.get(state.attempt).copied() else {
-            return;
-        };
-        state.scheduled = true;
-        delay_ms
-    };
-
-    spawn_local(async move {
-        async_std::task::sleep(Duration::from_millis(delay_ms)).await;
-        if !player.is_connected() {
-            return;
-        }
-        retry_state.borrow_mut().scheduled = false;
-        start_media_retry(&player, true, &retry_state);
-    });
-}
-
-fn start_media_retry(
-    player: &Element,
-    advance_attempt: bool,
-    retry_state: &Rc<RefCell<MediaRetryState>>,
-) {
-    if !player.is_connected() {
-        return;
-    }
-    remember_media_retry_time(player, retry_state);
-    {
-        let mut state = retry_state.borrow_mut();
-        if !state.errored || state.retrying {
-            return;
-        }
-        state.attempt = if advance_attempt {
-            state.attempt.saturating_add(1)
-        } else {
-            0
-        };
-        state.retrying = true;
-        state.scheduled = false;
-    }
-    if let Some(player) = player.dyn_ref::<HtmlMediaElement>() {
-        player.load();
-    }
-    apply_media_retry_time(player, retry_state);
-    start_streaming_player(player);
-}
-
-fn remember_media_retry_time(player: &Element, retry_state: &RefCell<MediaRetryState>) {
-    let Some(time) = media_current_time(player) else {
-        return;
-    };
-    if time <= 0.0 {
-        return;
-    }
-    retry_state.borrow_mut().playback_time = Some(time);
-}
-
-fn apply_media_retry_time(player: &Element, retry_state: &RefCell<MediaRetryState>) {
-    let Some(time) = retry_state.borrow().playback_time else {
-        return;
-    };
-    if let Some(player) = player.dyn_ref::<HtmlMediaElement>() {
-        player.set_current_time(time);
-    }
-}
-
-fn media_current_time(player: &Element) -> Option<f64> {
-    player
-        .dyn_ref::<HtmlMediaElement>()
-        .map(HtmlMediaElement::current_time)
-        .filter(|time| time.is_finite())
-}
-
-fn navigate_to_bzz_url(src: &str) {
-    if let Some(location) = web_sys::window().map(|window| window.location()) {
-        let _ = location.assign(src);
-    }
-}

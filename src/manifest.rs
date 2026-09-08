@@ -462,7 +462,6 @@ pub(crate) fn manifest_wrapped_reference(parsed: ParsedBzzManifest) -> Option<Ve
     parsed.wrapped_reference
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) async fn acquire_bzz_collection(
     reference: Vec<u8>,
     chunk_retrieve_chan: &crate::ChunkRetrieveSender,

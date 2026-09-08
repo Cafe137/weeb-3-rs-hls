@@ -1,6 +1,6 @@
 use crate::conventions::{eip191_hash_message, public_key_address};
 use k256::ecdsa::SigningKey;
-use web3::types::Address;
+use alloy_primitives::Address;
 
 #[derive(Clone)]
 pub(crate) struct PrivateKeySigner {
