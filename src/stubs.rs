@@ -12,15 +12,7 @@ pub(crate) async fn get_price_from_oracle() -> Option<(U256, U256)> {
     None
 }
 
-/// No ENS: viewers address content by hex reference or by feed owner + topic.
-pub(crate) async fn resolve_ens_reference(_reference: String, _suffix: &str) -> Vec<u8> {
-    Vec::new()
-}
 
-/// No stamp: viewers never upload, so there is no feed owner of our own.
-pub(crate) async fn secure_ensure_feed_owner() -> Option<Vec<u8>> {
-    None
-}
 
 pub(crate) mod secure_vault {
     /// No chequebook, so cheques are never active.

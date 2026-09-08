@@ -44,17 +44,10 @@ prost = "0.14.4"
 rand = "0.8"
 serde_json = "1"
 hex = "0.4.3"
-base64 = "0.22.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
-tar = { git = "https://github.com/alexcrichton/tar-rs.git" }
-mime_guess = { git = "https://github.com/abonander/mime_guess.git", default-features = false }
 percent-encoding = "2"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mimalloc = { version = "0.1", default-features = false }
 
-[dev-dependencies]
-anyhow = "1"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1"

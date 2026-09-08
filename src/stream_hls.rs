@@ -1,12 +1,20 @@
 //! Minimal append-only HLS feed reader with a duration-based live startup runway.
+//!
+//! Only `parse` is on the viewer's path today: it turns a feed payload into a
+//! playlist, and `viewer::Viewer::playlist` stops there. Everything past it is
+//! the live path - startup runways, tail merging, playlist reconstruction, gap
+//! tagging - and stays unreachable until `HlsStart::Live` is wired through
+//! `viewer.rs`. It is kept rather than reaped because it encodes HLS sequencing
+//! semantics (discontinuity sequences, tail joins, gap segments) that are
+//! fiddly to re-derive, so the allow below is deliberate and scoped to this
+//! module.
+#![allow(dead_code)]
 
 use std::fmt::Write;
 
 use crate::stream_conventions::HlsStart;
 
 pub(crate) const HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0;
-pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;
-pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 const HLS_HEADER: &str = "#EXTM3U";
@@ -39,10 +47,6 @@ pub(crate) struct HlsStartupPlan {
     pub(crate) duration: f64,
 }
 
-pub(crate) struct PreparedHlsFeed {
-    pub(crate) source: String,
-    pub(crate) plan: HlsStartupPlan,
-}
 
 #[derive(Default)]
 pub(crate) struct HlsTailFailure {
@@ -74,21 +78,6 @@ impl HlsTailFailure {
     }
 }
 
-pub(crate) fn hls_progressive_foreground_transition(
-    last_foreground_position: usize,
-    foreground_position: usize,
-    cached: bool,
-) -> (bool, usize) {
-    if cached && foreground_position < last_foreground_position {
-        (false, last_foreground_position)
-    } else {
-        (
-            foreground_position < last_foreground_position
-                || last_foreground_position.abs_diff(foreground_position) > 1,
-            foreground_position,
-        )
-    }
-}
 
 impl HlsPlaylist {
     pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
@@ -450,24 +439,6 @@ pub(crate) fn is_hls_manifest(bytes: &[u8]) -> bool {
         .is_some_and(|line| line.trim() == HLS_HEADER)
 }
 
-pub(crate) fn hls_payload_mime(bytes: &[u8]) -> &'static str {
-    if bytes.first() == Some(&0x47) && bytes.get(188) == Some(&0x47) {
-        "video/mp2t"
-    } else if bytes
-        .get(4..8)
-        .is_some_and(|kind| matches!(kind, b"ftyp" | b"styp" | b"moof" | b"moov"))
-    {
-        "video/mp4"
-    } else if bytes.starts_with(b"WEBVTT") {
-        "text/vtt; charset=utf-8"
-    } else if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xf6 == 0xf0 {
-        "audio/aac"
-    } else if is_hls_manifest(bytes) {
-        "application/vnd.apple.mpegurl"
-    } else {
-        "application/octet-stream"
-    }
-}
 
 impl HlsSegment {
     fn same_payload(&self, candidate: &Self) -> bool {
@@ -558,11 +529,4 @@ fn is_hex_reference(value: &str) -> bool {
     matches!(value.len(), 64 | 128) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[path = "stream_hls/runtime.rs"]
-pub(crate) mod runtime;
 
-pub(crate) use runtime::{
-    clear_hls_runtime_cache, install_live_tail_fallback, live_tail_failure_identity,
-    lock_live_startup_plan, prepare_hls_feed, release_hls_runtime, start_beginning_history,
-    try_fetch_response,
-};

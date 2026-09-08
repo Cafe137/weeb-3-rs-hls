@@ -3,45 +3,8 @@ pub(crate) fn next_nonzero_generation(current: u64) -> u64 {
     if next == 0 { 1 } else { next }
 }
 
-pub(crate) fn generation_is_newer(candidate: u64, current: u64) -> bool {
-    const SERIAL_HALF_RANGE: u64 = 1_u64 << 63;
-
-    candidate != current && candidate.wrapping_sub(current) < SERIAL_HALF_RANGE
-}
-
-pub(crate) fn latest_registered_generation(current: u64, candidate: u64) -> u64 {
-    if current == 0 || generation_is_newer(candidate, current) {
-        candidate
-    } else {
-        current
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PendingGenerationRelation {
-    Join,
-    RejectStale,
-    Replace,
-}
-
-pub(crate) fn pending_generation_relation(
-    pending_generation: u64,
-    candidate_generation: u64,
-) -> PendingGenerationRelation {
-    if pending_generation == candidate_generation
-        || pending_generation == 0
-        || candidate_generation == 0
-    {
-        PendingGenerationRelation::Join
-    } else if generation_is_newer(candidate_generation, pending_generation) {
-        PendingGenerationRelation::Replace
-    } else {
-        PendingGenerationRelation::RejectStale
-    }
-}
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
-use async_std::sync::Mutex;
 use event_listener::Event;
 use futures::{
     future::{Either, select},
@@ -62,11 +25,6 @@ pub(crate) struct TransferPause {
 }
 
 impl TransferPause {
-    pub(crate) fn toggle(&self) -> bool {
-        let paused = !self.paused.fetch_xor(true, Ordering::AcqRel);
-        self.changed.notify(usize::MAX);
-        paused
-    }
 }
 
 pub(crate) fn transfer_pause_enabled(paused: &Arc<TransferPause>) -> bool {
@@ -124,40 +82,6 @@ impl RetrieveCancelToken {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct RetrieveCancelRegistry {
-    scopes: Mutex<HashMap<Arc<str>, Arc<RetrieveCancelScope>>>,
-}
-
-impl RetrieveCancelRegistry {
-    pub(crate) async fn register(
-        &self,
-        stream_key: String,
-        generation: u64,
-    ) -> Option<RetrieveCancelToken> {
-        if stream_key.is_empty() || generation == 0 {
-            return None;
-        }
-
-        let stream_key: Arc<str> = stream_key.into();
-        let mut scopes = self.scopes.lock().await;
-        let scope = scopes
-            .entry(stream_key.clone())
-            .or_insert_with(Arc::default)
-            .clone();
-        let current = scope.latest.load(Ordering::Acquire);
-        let latest = latest_registered_generation(current, generation);
-        if latest != current {
-            scope.latest.store(latest, Ordering::Release);
-            scope.changed.notify(usize::MAX);
-        }
-        Some(RetrieveCancelToken {
-            stream_key,
-            generation,
-            scope,
-        })
-    }
-}
 
 pub(crate) fn retrieve_cancel_token_current(cancel: &Option<RetrieveCancelToken>) -> bool {
     cancel.as_ref().is_none_or(RetrieveCancelToken::is_current)
@@ -346,12 +270,6 @@ impl RetrieveAdmission {
         }
     }
 
-    pub(crate) fn timed_out_physical_attempts(&self) -> Option<usize> {
-        self.inner
-            .timed_out_attempts
-            .as_ref()
-            .map(|timed_out| timed_out.load(Ordering::SeqCst))
-    }
 
     pub(crate) fn record_confirmed_empty_physical_attempt(&self) {
         if let Some(confirmed_empty) = self.inner.confirmed_empty_attempts.as_ref() {
@@ -359,12 +277,6 @@ impl RetrieveAdmission {
         }
     }
 
-    pub(crate) fn confirmed_empty_physical_attempts(&self) -> Option<usize> {
-        self.inner
-            .confirmed_empty_attempts
-            .as_ref()
-            .map(|confirmed_empty| confirmed_empty.load(Ordering::SeqCst))
-    }
 
     /// Atomically claim one physical exchange before it is dispatched. An exhausted finite
     /// budget closes only future admission; exchanges that already claimed a slot still settle.

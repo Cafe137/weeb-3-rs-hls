@@ -1,7 +1,6 @@
 use crate::{
     ChunkRetrieveSender, Date, Duration, HashMap, Mutex, OutboundProtocolSession, OverlayPeerMap,
-    PeerAccounting, PeerAccountingMap, PeerId, PhysicalConnectionMap,
-    RETRIEVE_CHECK_CONFIRMATION_PEERS, RefreshmentInstruction, RetrieveCancelToken, StreamControl,
+    PeerAccounting, PeerAccountingMap, PeerId, PhysicalConnectionMap, RefreshmentInstruction, RetrieveCancelToken, StreamControl,
     TransferPause, apply_credit, bee_replica_address, cancel_reserve, encryption_segment_key,
     erasure_coding::{
         self, BEE_MAX_UPLOAD_TREE_LEVELS, CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, HASH_SIZE,
@@ -2011,75 +2010,6 @@ pub async fn retrieve_chunk(
     decode_retrieved_chunk(chunk, soc, encryption_key, encrypted)
 }
 
-pub async fn retrieve_check_chunk(
-    chunk_address: &[u8],
-    control: StreamControl,
-    peers: &OverlayPeerMap,
-    accounting: &PeerAccountingMap,
-    physical_connections: &PhysicalConnectionMap,
-    refresh_chan: &mpsc::Sender<RefreshmentInstruction>,
-    transfer_paused: Option<Arc<TransferPause>>,
-) -> Vec<u8> {
-    let (caddr, encryption_key, encrypted) = chunk_address_parts(chunk_address);
-
-    let mut skiplist = HashMap::new();
-    let mut successes = 0;
-    let mut error_count = 0;
-    let max_error = 21 - RETRIEVE_CHECK_CONFIRMATION_PEERS;
-
-    let mut retrieved = None;
-
-    while error_count < max_error && successes < RETRIEVE_CHECK_CONFIRMATION_PEERS {
-        if let Some(paused) = &transfer_paused {
-            wait_transfer_unpaused(paused).await;
-        }
-
-        let Some(selected) = select_retrieve_peer(
-            caddr,
-            peers,
-            accounting,
-            physical_connections,
-            &mut skiplist,
-        )
-        .await
-        else {
-            reset_overdraft(&mut skiplist);
-            async_std::task::sleep(Duration::from_millis(RETRIEVE_CHECK_RETRY_WAIT_MS)).await;
-            continue;
-        };
-
-        if transfer_is_paused(&transfer_paused) {
-            cancel_reserve(&selected.accounting, selected.price).await;
-            continue;
-        }
-
-        let result = retrieve_attempt(
-            selected,
-            caddr.to_vec(),
-            control.clone(),
-            refresh_chan.clone(),
-            None,
-        )
-        .await;
-        if result.valid {
-            successes += 1;
-            if retrieved.is_none() {
-                retrieved = Some((result.chunk, result.soc));
-            }
-        } else {
-            error_count += 1;
-        }
-    }
-
-    if successes < RETRIEVE_CHECK_CONFIRMATION_PEERS {
-        return vec![];
-    }
-
-    let Some((chunk, soc)) = retrieved else {
-        return vec![];
-    };
-    decode_retrieved_chunk(chunk, soc, encryption_key, encrypted)
-}
 
 pub fn verify_chunk(caddr: &[u8], cd: &[u8]) -> (bool, bool) {
     if valid_cac(cd, caddr) {
@@ -2185,16 +2115,6 @@ async fn seek_feed_frontier(
     }
 }
 
-pub async fn seek_latest_feed_update(
-    owner: String,
-    topic: String,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Vec<u8> {
-    seek_latest_feed_update_indexed(owner, topic, chunk_retrieve_chan)
-        .await
-        .map(|(_, payload)| payload)
-        .unwrap_or_default()
-}
 
 pub(crate) async fn seek_latest_feed_update_indexed(
     owner: String,
@@ -2216,14 +2136,6 @@ pub(crate) async fn seek_latest_feed_update_indexed_observing_positive(
         .0
 }
 
-pub async fn seek_next_feed_update_index(
-    owner: String,
-    topic: String,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> u64 {
-    let (_latest, next_index) = seek_feed_frontier(owner, topic, chunk_retrieve_chan, None).await;
-    next_index
-}
 
 #[cfg(test)]
 mod decrypt_tests {
@@ -2269,7 +2181,7 @@ mod decrypt_tests {
         let mut encrypted_reference = vec![0x11; HASH_SIZE];
         encrypted_reference.extend_from_slice(&key);
         let (address, extracted_key, encrypted) = chunk_address_parts(&encrypted_reference);
-        assert_eq!(address, encrypted_reference[..HASH_SIZE]);
+        assert_eq!(address, &encrypted_reference[..HASH_SIZE]);
         assert_eq!(extracted_key, key);
         assert!(encrypted);
         assert_eq!(
@@ -2334,7 +2246,6 @@ mod decrypt_tests {
 #[cfg(test)]
 mod raw_fetch_tests {
     use super::*;
-    use alloy_primitives::keccak256;
 
     #[test]
     fn decoded_cache_lru_reuses_the_stored_bytes_key() {
@@ -2389,7 +2300,9 @@ mod raw_fetch_tests {
     fn zero_waiter_late_success_caches_every_full_reference_owned_by_the_flight() {
         let mut raw = 29_u64.to_le_bytes().to_vec();
         raw.extend_from_slice(b"late raw cache payload");
-        let expected_cac = keccak256(&raw).to_vec();
+        let expected_cac = crate::conventions::content_address_array(&raw)
+            .expect("fixture chunk is addressable")
+            .to_vec();
         let plain_reference = expected_cac.clone();
         let mut encrypted_reference = expected_cac.clone();
         encrypted_reference.extend_from_slice(&[0x5a; HASH_SIZE]);

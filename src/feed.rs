@@ -270,13 +270,6 @@ where
     keccak(&preimage)
 }
 
-pub(crate) fn sequence_feed_id(
-    topic: &[u8],
-    index: u64,
-    mut keccak: impl FnMut(&[u8]) -> [u8; 32],
-) -> [u8; 32] {
-    sequence_feed_id_with(topic, index, &mut keccak)
-}
 
 pub(crate) fn sequence_feed_address(
     topic: &[u8],
@@ -291,12 +284,4 @@ pub(crate) fn sequence_feed_address(
     keccak(&preimage)
 }
 
-pub(crate) fn exact_js_feed_index(index: u64) -> Option<f64> {
-    exact_u64_as_f64(index)
-}
 
-fn exact_u64_as_f64(value: u64) -> Option<f64> {
-    let number = value as f64;
-    const U64_UPPER_BOUND_EXCLUSIVE: f64 = 18_446_744_073_709_551_616.0;
-    (number < U64_UPPER_BOUND_EXCLUSIVE && number as u64 == value).then_some(number)
-}

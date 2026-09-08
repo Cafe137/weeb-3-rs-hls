@@ -32,12 +32,11 @@ impl PrivateKeySigner {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[wasm_bindgen_test]
+    #[test]
     fn eip191_message_signature_is_stable() {
         let signer = PrivateKeySigner::from_slice(&[1; 32]).expect("fixture private key");
         let message = b"weeb-3 handshake signing fixture";
@@ -53,7 +52,7 @@ mod tests {
                 .recover_address_from_msg(message)
                 .expect("recover fixture signer")
                 .as_slice(),
-            signer.address().as_bytes()
+            signer.address().as_slice()
         );
         assert_eq!(
             hex::encode(signer.address()),

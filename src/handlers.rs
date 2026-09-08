@@ -12,23 +12,15 @@ use libp2p::{
 use alloy_primitives::{Address, U256};
 
 use crate::conventions::*;
-use crate::weeb_3::etiquette_0;
 use crate::weeb_3::etiquette_1;
 use crate::weeb_3::etiquette_2;
 use crate::weeb_3::etiquette_4;
 use crate::weeb_3::etiquette_5;
 use crate::weeb_3::etiquette_6;
-use crate::weeb_3::etiquette_7;
-use crate::weeb_3::etiquette_8;
 
-use crate::persistence::{
-    get_chequebook_address, get_chequebook_last_issued_cheque_payout, get_chequebook_signer_key,
-    set_chequebook_last_issued_cheque_payout,
-};
 
 use crate::HANDSHAKE_PROTOCOL;
 use crate::PSEUDOSETTLE_PROTOCOL;
-use crate::PUSHSYNC_PROTOCOL;
 use crate::RETRIEVAL_PROTOCOL;
 use crate::SWAP_PROTOCOL;
 use crate::{OutboundProtocolSession, PeerDialInstruction, TransportConnectionSession};
@@ -58,12 +50,6 @@ fn decode_big_endian_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(value))
 }
 
-struct OutgoingChequeState {
-    beneficiary: Address,
-    chequebook: Address,
-    effective_deduction: U256,
-    cumulative_payout: U256,
-}
 
 async fn read_control_protocol_frame(stream: &mut Stream) -> Option<Vec<u8>> {
     read_control_protocol_frame_bounded(stream, CONTROL_PROTOCOL_MAX_FRAME_BYTES).await
@@ -91,44 +77,6 @@ async fn read_control_protocol_frame_bounded(stream: &mut Stream, maximum: u64) 
     None
 }
 
-async fn prepare_outgoing_cheque_state(
-    beneficiary: Address,
-    amount: u64,
-    price: U256,
-    deduction: U256,
-) -> Option<OutgoingChequeState> {
-    let chequebook_bytes = get_chequebook_address().await;
-    if chequebook_bytes.len() != 20 {
-        return None;
-    }
-    let chequebook = Address::from_slice(&chequebook_bytes);
-
-    let last_payout_bytes =
-        get_chequebook_last_issued_cheque_payout(chequebook.as_slice(), beneficiary.as_slice())
-            .await;
-    let stored_cumulative_payout = match last_payout_bytes.len() {
-        0 => U256::ZERO,
-        1..=32 => U256::from_be_slice(&last_payout_bytes),
-        _ => return None,
-    };
-
-    let effective_deduction = if stored_cumulative_payout.is_zero() {
-        deduction
-    } else {
-        U256::ZERO
-    };
-    let cheque_delta = U256::from(amount).checked_mul(price)?;
-    let cumulative_payout = stored_cumulative_payout
-        .checked_add(cheque_delta)?
-        .checked_add(effective_deduction)?;
-
-    Some(OutgoingChequeState {
-        beneficiary,
-        chequebook,
-        effective_deduction,
-        cumulative_payout,
-    })
-}
 
 async fn handshake_exchange(
     peer: PeerId,
@@ -491,51 +439,4 @@ pub async fn retrieve_handler(
     retrieval_exchange(chunk_address, stream).await
 }
 
-pub async fn pushsync_handler(
-    peer: PeerId,
-    chunk_address: Vec<u8>,
-    chunk_content: Vec<u8>,
-    chunk_stamp: Vec<u8>,
-    control: StreamControl,
-    session: OutboundProtocolSession,
-) -> bool {
-    let Some(stream) =
-        open_current_outbound_stream(peer, control, PUSHSYNC_PROTOCOL, &session).await
-    else {
-        return false;
-    };
 
-    pushsync_exchange(chunk_address, chunk_content, chunk_stamp, stream)
-        .await
-        .is_some()
-}
-
-async fn pushsync_exchange(
-    chunk_address: Vec<u8>,
-    chunk_content: Vec<u8>,
-    chunk_stamp: Vec<u8>,
-    mut stream: Stream,
-) -> Option<()> {
-    stream.write_all(EMPTY_HEADERS_FRAME).await.ok()?;
-    let _ = stream.flush().await;
-
-    read_control_protocol_frame(&mut stream).await?;
-
-    let delivery = etiquette_7::Delivery {
-        address: chunk_address,
-        data: chunk_content,
-        stamp: chunk_stamp,
-    };
-
-    let delivery_frame = delivery.encode_length_delimited_to_vec();
-    stream.write_all(&delivery_frame).await.ok()?;
-    stream.flush().await.ok()?;
-
-    let _ = stream.close().await;
-
-    let receipt_frame = read_control_protocol_frame(&mut stream).await?;
-    let receipt = etiquette_7::Receipt::decode(receipt_frame.as_slice()).ok()?;
-
-    (receipt.err.is_empty() && receipt.address == delivery.address && !receipt.signature.is_empty())
-        .then_some(())
-}

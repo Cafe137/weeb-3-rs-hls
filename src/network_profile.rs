@@ -15,9 +15,6 @@ pub(crate) enum NetworkMode {
 pub(crate) struct NetworkProfile {
     pub mode: NetworkMode,
     pub swarm_network_id: u64,
-    pub wallet_chain_id: u64,
-    pub base_symbol: &'static str,
-    pub bzz_symbol: &'static str,
     pub bootnodes: &'static [&'static str],
 }
 
@@ -357,18 +354,12 @@ pub(crate) const MAINNET_BOOTNODES: &[&str] = &[
 pub(crate) const TESTNET_PROFILE: NetworkProfile = NetworkProfile {
     mode: NetworkMode::Testnet,
     swarm_network_id: 10,
-    wallet_chain_id: 11155111,
-    base_symbol: "Sepolia ETH",
-    bzz_symbol: "sBZZ",
     bootnodes: TESTNET_BOOTNODES,
 };
 
 pub(crate) const MAINNET_PROFILE: NetworkProfile = NetworkProfile {
     mode: NetworkMode::Mainnet,
     swarm_network_id: 1,
-    wallet_chain_id: 100,
-    base_symbol: "xDAI",
-    bzz_symbol: "xBZZ",
     bootnodes: MAINNET_BOOTNODES,
 };
 
@@ -380,24 +371,11 @@ pub(crate) fn profile_for_swarm_network_id(network_id: u64) -> Option<NetworkPro
     }
 }
 
-pub(crate) fn profile_for_mode(mode: NetworkMode) -> NetworkProfile {
-    match mode {
-        NetworkMode::Testnet => TESTNET_PROFILE,
-        NetworkMode::Mainnet => MAINNET_PROFILE,
-    }
-}
 
 pub(crate) fn activate_profile(profile: NetworkProfile) {
     MAINNET_ACTIVE.store(profile.mode == NetworkMode::Mainnet, Ordering::Relaxed);
 }
 
-pub(crate) fn active_profile() -> NetworkProfile {
-    if MAINNET_ACTIVE.load(Ordering::Relaxed) {
-        MAINNET_PROFILE
-    } else {
-        TESTNET_PROFILE
-    }
-}
 
 pub(crate) fn initial_bootnodes(profile: NetworkProfile) -> Vec<&'static str> {
     let mut bootnodes = profile.bootnodes.to_vec();
@@ -406,6 +384,3 @@ pub(crate) fn initial_bootnodes(profile: NetworkProfile) -> Vec<&'static str> {
     bootnodes
 }
 
-pub(crate) fn is_browser_dialable_underlay(address: &str) -> bool {
-    address.contains("/ws/") || address.contains("/wss/")
-}

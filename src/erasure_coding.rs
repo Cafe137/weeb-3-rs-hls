@@ -53,7 +53,6 @@ pub enum RedundancyLevel {
 }
 
 impl RedundancyLevel {
-    pub const DEFAULT_UPLOAD: Self = Self::Medium;
     pub const DEFAULT_DOWNLOAD: Self = Self::Paranoid;
 
     pub fn from_u8(value: u8) -> Option<Self> {
@@ -160,9 +159,6 @@ const ENC_PARANOID_PARITIES: [usize; 18] = [
     87, 84, 81, 78, 75, 71, 68, 65, 61, 58, 54, 50, 47, 43, 38, 34, 29, 23,
 ];
 
-pub fn encode_level(span: &mut [u8; SPAN_SIZE], level: RedundancyLevel) {
-    span[SPAN_SIZE - 1] = 0x80 | level.as_u8();
-}
 
 pub fn decode_span(span: &[u8]) -> Option<(RedundancyLevel, u64)> {
     let mut decoded: [u8; SPAN_SIZE] = span.get(..SPAN_SIZE)?.try_into().ok()?;
@@ -184,63 +180,6 @@ pub struct ReferenceLayout {
     pub child_capacity: u64,
 }
 
-pub fn upload_tree_chunk_count(
-    data_length: u64,
-    level: RedundancyLevel,
-    encrypted: bool,
-) -> Option<u64> {
-    let chunk_size = CHUNK_SIZE as u64;
-    let mut input_chunks = data_length / chunk_size;
-    if !data_length.is_multiple_of(chunk_size) {
-        input_chunks = input_chunks.checked_add(1)?;
-    }
-    input_chunks = input_chunks.max(1);
-
-    let max_shards = u64::try_from(level.max_shards(encrypted)).ok()?;
-    if max_shards < 2 {
-        return None;
-    }
-
-    let mut total_chunks = input_chunks;
-    let mut tree_level = 0;
-
-    while input_chunks > 1 {
-        if tree_level >= BEE_MAX_UPLOAD_TREE_LEVELS {
-            return None;
-        }
-        let full_groups = input_chunks / max_shards;
-        let remainder = input_chunks % max_shards;
-        let partial_group_shards = if remainder > 1 {
-            usize::try_from(remainder).ok()?
-        } else {
-            0
-        };
-        let partial_groups = u64::from(partial_group_shards != 0);
-        let carrier_chunks = u64::from(remainder == 1);
-        let level_parents = full_groups.checked_add(partial_groups)?;
-        let full_parities = full_groups.checked_mul(
-            u64::try_from(level.parities(usize::try_from(max_shards).ok()?, encrypted)).ok()?,
-        )?;
-        let partial_parities = if partial_group_shards == 0 {
-            0
-        } else {
-            u64::try_from(level.parities(partial_group_shards, encrypted)).ok()?
-        };
-        let level_parities = full_parities.checked_add(partial_parities)?;
-        let output_chunks = level_parents.checked_add(carrier_chunks)?;
-        if output_chunks >= input_chunks {
-            return None;
-        }
-
-        total_chunks = total_chunks
-            .checked_add(level_parents)?
-            .checked_add(level_parities)?;
-        input_chunks = output_chunks;
-        tree_level += 1;
-    }
-
-    Some(total_chunks)
-}
 
 pub fn reference_layout(
     span: u64,
@@ -343,60 +282,6 @@ pub enum ReedSolomonError {
     InvalidShardSize,
     TooFewShards,
     SingularMatrix,
-}
-
-pub struct ParityEncoder<'a> {
-    data_shards: Vec<&'a [u8]>,
-    matrix: Rc<Vec<Vec<u8>>>,
-    shard_size: usize,
-    data_count: usize,
-    parity_count: usize,
-}
-
-impl<'a> ParityEncoder<'a> {
-    pub fn new_padded(
-        data_shards: &[&'a [u8]],
-        parity_count: usize,
-        shard_size: usize,
-    ) -> Result<Self, ReedSolomonError> {
-        let data_count = data_shards.len();
-        let total_count = data_count
-            .checked_add(parity_count)
-            .ok_or(ReedSolomonError::InvalidShardCount)?;
-        if data_count == 0 || parity_count == 0 || total_count > 256 {
-            return Err(ReedSolomonError::InvalidShardCount);
-        }
-        if shard_size == 0
-            || data_shards
-                .iter()
-                .any(|shard| shard.is_empty() || shard.len() > shard_size)
-        {
-            return Err(ReedSolomonError::InvalidShardSize);
-        }
-
-        Ok(Self {
-            data_shards: data_shards.to_vec(),
-            matrix: cached_coding_matrix(data_count, total_count)?,
-            shard_size,
-            data_count,
-            parity_count,
-        })
-    }
-
-    pub fn parity_count(&self) -> usize {
-        self.parity_count
-    }
-
-    pub fn encode_shard(&self, parity_index: usize) -> Result<Vec<u8>, ReedSolomonError> {
-        if parity_index >= self.parity_count {
-            return Err(ReedSolomonError::InvalidShardCount);
-        }
-        Ok(code_row_slices(
-            &self.matrix[self.data_count + parity_index],
-            &self.data_shards,
-            self.shard_size,
-        ))
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -831,126 +716,14 @@ const fn multiplication_table() -> [[u8; 256]; 256] {
 
 static GF_MUL: [[u8; 256]; 256] = multiplication_table();
 
-pub(crate) fn validated_upload_redundancy(value: u8) -> Option<RedundancyLevel> {
-    RedundancyLevel::from_u8(value)
-}
 
-pub(crate) fn validated_upload_redundancy_number(value: f64) -> Option<RedundancyLevel> {
-    if !value.is_finite()
-        || value.fract() != 0.0
-        || !(u8::MIN as f64..=u8::MAX as f64).contains(&value)
-    {
-        return None;
-    }
-    validated_upload_redundancy(value as u8)
-}
 
-pub(crate) fn upload_redundancy_from_select(value: Option<&str>) -> RedundancyLevel {
-    value
-        .and_then(|value| value.parse::<u8>().ok())
-        .and_then(validated_upload_redundancy)
-        .unwrap_or(RedundancyLevel::DEFAULT_UPLOAD)
-}
 
-pub(crate) type ResourceEntry = (Vec<u8>, String, String);
 
-fn encoded_field_len(len: usize) -> Option<usize> {
-    8usize.checked_add(len)
-}
 
-fn push_field(output: &mut Vec<u8>, bytes: &[u8]) -> Option<()> {
-    let len = u64::try_from(bytes.len()).ok()?;
-    output.extend_from_slice(&len.to_le_bytes());
-    output.extend_from_slice(bytes);
-    Some(())
-}
 
-pub(crate) fn encode_resource_bundle(
-    resources: Vec<ResourceEntry>,
-    index: String,
-) -> Option<Vec<u8>> {
-    let mut encoded_len = encoded_field_len(index.len())?;
-    for (data, media_type, name) in &resources {
-        encoded_len = encoded_len
-            .checked_add(encoded_field_len(media_type.len())?)?
-            .checked_add(encoded_field_len(name.len())?)?
-            .checked_add(encoded_field_len(data.len())?)?;
-    }
 
-    let mut output = Vec::new();
-    output.try_reserve_exact(encoded_len).ok()?;
-    push_field(&mut output, index.as_bytes())?;
-    for (data, media_type, name) in resources {
-        push_field(&mut output, media_type.as_bytes())?;
-        push_field(&mut output, name.as_bytes())?;
-        push_field(&mut output, &data)?;
-    }
-    debug_assert_eq!(output.len(), encoded_len);
-    Some(output)
-}
 
-fn read_len(input: &[u8], cursor: &mut usize) -> Option<usize> {
-    let end = cursor.checked_add(8)?;
-    let bytes: [u8; 8] = input.get(*cursor..end)?.try_into().ok()?;
-    *cursor = end;
-    usize::try_from(u64::from_le_bytes(bytes)).ok()
-}
 
-fn read_bytes<'a>(input: &'a [u8], cursor: &mut usize, len: usize) -> Option<&'a [u8]> {
-    let end = cursor.checked_add(len)?;
-    let bytes = input.get(*cursor..end)?;
-    *cursor = end;
-    Some(bytes)
-}
 
-fn read_string(input: &[u8], cursor: &mut usize) -> Option<String> {
-    let len = read_len(input, cursor)?;
-    let bytes = read_bytes(input, cursor, len)?;
-    Some(String::from_utf8(bytes.to_vec()).unwrap_or_default())
-}
 
-pub(crate) fn decode_resource_bundle(input: &[u8]) -> Option<(Vec<ResourceEntry>, String)> {
-    let mut cursor = 0;
-    let index = read_string(input, &mut cursor)?;
-    let mut resources = Vec::new();
-
-    while cursor < input.len() {
-        let media_type = read_string(input, &mut cursor)?;
-        let name = read_string(input, &mut cursor)?;
-        let data_len = read_len(input, &mut cursor)?;
-        let data = read_bytes(input, &mut cursor, data_len)?.to_vec();
-        resources.push((data, media_type, name));
-    }
-
-    Some((resources, index))
-}
-
-pub(crate) const FILE_UPLOAD_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
-
-pub(crate) struct FileSlicePlan {
-    size: u64,
-    next: u64,
-}
-
-impl FileSlicePlan {
-    pub(crate) fn new(size: u64) -> Self {
-        Self { size, next: 0 }
-    }
-}
-
-impl Iterator for FileSlicePlan {
-    type Item = (u64, u64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next >= self.size {
-            return None;
-        }
-
-        let start = self.next;
-        let end = start
-            .saturating_add(FILE_UPLOAD_READ_WINDOW_BYTES)
-            .min(self.size);
-        self.next = end;
-        Some((start, end))
-    }
-}

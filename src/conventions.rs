@@ -154,7 +154,7 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
     }))
 }
 
-fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
+pub(crate) fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
     if !(SPAN_SIZE..=SPAN_SIZE + CHUNK_SIZE).contains(&chunk_content.len()) {
         return None;
     }
@@ -165,12 +165,6 @@ fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
     hash_input[..SPAN_SIZE].copy_from_slice(span);
     hash_input[SPAN_SIZE..].copy_from_slice(&root);
     Some(keccak256(hash_input))
-}
-
-pub fn content_address(chunk_content: &[u8]) -> Vec<u8> {
-    content_address_array(chunk_content)
-        .map(|hash| hash.to_vec())
-        .unwrap_or_default()
 }
 
 pub fn valid_cac(chunk_content: &[u8], address: &[u8]) -> bool {
@@ -217,9 +211,6 @@ pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
     .to_vec()
 }
 
-pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>, indx: String) -> Vec<u8> {
-    crate::erasure_coding::encode_resource_bundle(data_array, indx).unwrap_or_default()
-}
 
 pub(crate) fn normalize_feed_topic(topic: &str) -> String {
     let trimmed = topic.trim();
@@ -240,20 +231,7 @@ pub(crate) fn strip_hex_prefix(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-pub(crate) fn upload_result(message: &str, index: &str) -> Vec<u8> {
-    encode_resources(
-        vec![(
-            message.as_bytes().to_vec(),
-            "text/plain".to_string(),
-            "... result ...".to_string(),
-        )],
-        index.to_string(),
-    )
-}
 
-pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)>, String) {
-    crate::erasure_coding::decode_resource_bundle(&encoded_data).unwrap_or_default()
-}
 
 
 pub const EMPTY_CHEQUEBOOK_ADDRESS: [u8; 20] = [0; 20];
@@ -332,9 +310,8 @@ pub fn parse_address(
 #[cfg(test)]
 mod hash_tests {
     use super::*;
-    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[wasm_bindgen_test]
+    #[test]
     fn sparse_bmt_matches_the_full_tree_at_every_section_boundary() {
         let data: Vec<u8> = (0..CHUNK_SIZE).map(|index| (index % 251) as u8).collect();
         for boundary in (0..=CHUNK_SIZE).step_by(SECTION2_SIZE) {
@@ -363,7 +340,7 @@ mod hash_tests {
         assert!(!valid_cac(&[0; SPAN_SIZE - 1], &[0; HASH_SIZE]));
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn existing_keccak_backends_agree_at_rate_boundaries() {
         for length in [0, 32, 40, 64, 135, 136, 137, CHUNK_SIZE] {
             let input: Vec<u8> = (0..length).map(|index| index as u8).collect();

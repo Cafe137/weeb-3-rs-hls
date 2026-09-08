@@ -30,24 +30,7 @@ pub(crate) async fn yield_after_swarm_event(events_since_browser_yield: &mut usi
 }
 
 impl Weeb3 {
-    pub(crate) async fn has_unsettled_accounting(&self) -> bool {
-        let accounting_peers = {
-            let peers = self.wings.accounting_peers.lock().await;
-            peers.values().cloned().collect::<Vec<_>>()
-        };
-        for accounting_peer in accounting_peers {
-            if accounting_peer.lock().await.reserve != 0 {
-                return true;
-            }
-        }
 
-        !self.wings.ongoing_cheques.lock().await.is_empty()
-    }
-
-    pub(crate) async fn connection_counts(&self) -> (u64, u64) {
-        let population = self.connection_population.lock().await;
-        (population.connected, population.ongoing)
-    }
 
     pub(crate) async fn wait_for_connections(&self, minimum: u64, timeout_ms: u64) -> u64 {
         if timeout_ms == 0 {

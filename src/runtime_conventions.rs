@@ -1,58 +1,5 @@
 use crate::*;
 
-impl Weeb3 {
-    pub(crate) fn runtime_is_started(&self) -> bool {
-        self.runtime_started.load(Ordering::Acquire)
-    }
-
-    pub(crate) async fn start_progress(
-        &self,
-        kind: impl Into<String>,
-        subject: impl Into<String>,
-        phase: impl Into<String>,
-        percent: Option<u8>,
-        detail: impl Into<String>,
-    ) -> String {
-        self.progress
-            .lock()
-            .await
-            .start(kind, subject, phase, percent, detail)
-    }
-
-    pub(crate) async fn update_progress(
-        &self,
-        id: &str,
-        phase: impl Into<String>,
-        percent: Option<u8>,
-        detail: impl Into<String>,
-    ) {
-        self.progress
-            .lock()
-            .await
-            .update(id, phase, percent, detail);
-    }
-
-    pub(crate) async fn finish_progress(
-        &self,
-        id: &str,
-        phase: impl Into<String>,
-        detail: impl Into<String>,
-        ok: bool,
-    ) {
-        self.progress.lock().await.finish(id, phase, detail, ok);
-    }
-
-    pub(crate) async fn get_progress_snapshot(
-        &self,
-        seen_revision: u64,
-    ) -> Option<(u64, Vec<ProgressRow>)> {
-        self.progress
-            .lock()
-            .await
-            .snapshot_if_changed(seen_revision)
-    }
-}
-
 pub(crate) fn interface_log_to(log_port: &mpsc::Sender<String>, log_start_ms: f64, log0: String) {
     if log_port.is_full() {
         return;
@@ -108,26 +55,7 @@ pub(crate) struct ChunkRetrieveRequest {
     pub hedge_demand: Option<retrieval_conventions::SharedRetrieveHedgeDemand>,
 }
 
-pub(crate) fn chunk_retrieve_request(
-    address: Vec<u8>,
-    chan: mpsc::Sender<Vec<u8>>,
-) -> ChunkRetrieveRequest {
-    ChunkRetrieveRequest {
-        address,
-        chan,
-        cancel: None,
-        admission: None,
-        hedge_demand: None,
-    }
-}
 
-pub(crate) struct BzzRangeRequest {
-    pub(crate) metadata: BzzMetadata,
-    pub(crate) start: u64,
-    pub(crate) end_inclusive: u64,
-    pub(crate) cancel: Option<RetrieveCancelToken>,
-    pub(crate) chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
-}
 
 /// Native replacement for `js_sys::Date`: milliseconds since the Unix epoch.
 pub(crate) struct Date;

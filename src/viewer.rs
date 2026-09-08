@@ -12,8 +12,6 @@
 use crate::bzz_stream::{decode_feed_payload_root, retrieve_feed_payload};
 use crate::network_profile::{initial_bootnodes, profile_for_swarm_network_id};
 use crate::retrieval::{retrieval_cache_stats, retrieve_data_payload, seek_latest_feed_update_indexed};
-use crate::stream::fetch_cache_stats;
-use crate::stream_hls::runtime::body_cache_stats;
 use crate::stream_hls::{HlsPlaylist, MAX_STREAM_FEED_PAYLOAD_BYTES};
 use crate::{Weeb3, normalize_feed_topic, strip_hex_prefix};
 use async_std::sync::Arc;
@@ -110,10 +108,10 @@ impl Viewer {
     /// Live occupancy of every in-process cache that can retain retrieved
     /// content. Diagnostic: use it to attribute RSS growth to a specific cache
     /// rather than to the allocator.
+    /// Live occupancy and hit counters for the decoded-chunk cache, which is
+    /// the only cache on the viewer's path that retains content.
     pub fn cache_report(&self) -> String {
         let chunk = retrieval_cache_stats();
-        let (metadata, ranges, range_bytes) = fetch_cache_stats();
-        let (bodies, body_bytes) = body_cache_stats();
         let lookups = chunk.hits + chunk.misses;
         let hit_rate = if lookups == 0 {
             0.0
@@ -123,9 +121,7 @@ impl Viewer {
         format!(
             "chunk_cache={} entries/{:.1} MB order={} inflight={} \
              hits={} misses={} ({hit_rate:.1}% of {lookups}) served={:.1} MB \
-             inserts={} evictions={} \
-             fetch_cache={metadata} meta/{ranges} ranges/{:.1} MB \
-             body_cache={bodies} bodies/{:.1} MB",
+             inserts={} evictions={}",
             chunk.entries,
             chunk.bytes as f64 / 1e6,
             chunk.order,
@@ -135,8 +131,6 @@ impl Viewer {
             chunk.hit_bytes as f64 / 1e6,
             chunk.inserts,
             chunk.evictions,
-            range_bytes as f64 / 1e6,
-            body_bytes as f64 / 1e6,
         )
     }
 
@@ -182,7 +176,7 @@ impl Viewer {
             seek_latest_feed_update_indexed(owner, topic, &self.inner.chunk_port.0)
                 .await
                 .ok_or_else(|| "no feed update found".to_string())?;
-        let root = decode_feed_payload_root(index, update)
+        let root = decode_feed_payload_root(update)
             .ok_or_else(|| format!("feed update {index} is not a readable payload"))?;
         let bytes = retrieve_feed_payload(
             &root,
