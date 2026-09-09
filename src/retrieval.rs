@@ -22,6 +22,9 @@ use crate::{
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
     wait_transfer_unpaused, wait_transfer_unpaused_for_admission,
 };
+pub use crate::conventions::ChunkShape;
+use crate::conventions::chunk_structurally_usable;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use async_std::sync::Arc;
 use bytes::Bytes;
@@ -30,6 +33,43 @@ use std::{
     collections::{VecDeque, hash_map::Entry},
     rc::Rc,
 };
+
+/// Whether a retrieved chunk's content address is checked against what was
+/// asked for. `--unsafe` (the default) turns this off; `--verify` turns it on.
+///
+/// **Measured cost of having it on: 15% of a viewer's CPU** — the largest single
+/// item in a `perf` profile of a retrieving viewer (199 Hz, 883 samples, 6-core
+/// x86), all of it `keccak::backends::soft` under `content_address_array`. A BMT
+/// over one 4 KB chunk is 128 keccak-f1600 permutations, 22.3 us, and a viewer
+/// walks ~250 chunks a second at a realistic bitrate.
+///
+/// **What is given up.** Verification is not only an integrity check, it is the
+/// *retry signal*: `settle_retrieve_attempt` turns a failed verify into
+/// `valid: false`, which counts an error and moves to the next peer. With it
+/// off, the only thing separating "delivered" from "this peer does not have it"
+/// is `chunk_structurally_usable` — the length bounds. An empty reply, which is
+/// what a peer without the chunk actually sends, still fails and still retries.
+/// A peer that replies with well-formed *wrong* bytes is now believed, and the
+/// corruption surfaces as a decode error in whatever plays the segments rather
+/// than as a body failure in the metrics.
+///
+/// Feed updates are still authenticated whatever this is set to: they are a
+/// handful of chunks a second against ~250 data chunks, so the cost is
+/// unmeasurable, and an unverified playlist would fail a run in ways that look
+/// like a network problem.
+///
+/// For a load rig the consequence is that **viewer CPU is under-reported by
+/// ~15% against what a real browser client pays**, which is why the fleet
+/// records the setting on every run.
+static VERIFY_CONTENT_ADDRESSES: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verify_content_addresses(verify: bool) {
+    VERIFY_CONTENT_ADDRESSES.store(verify, AtomicOrdering::Relaxed);
+}
+
+pub fn verify_content_addresses() -> bool {
+    VERIFY_CONTENT_ADDRESSES.load(AtomicOrdering::Relaxed)
+}
 
 const RETRIEVE_HEDGE_AFTER_MS: u64 = 1_000;
 const RETRIEVE_RS_HEDGE_AFTER_MS: u64 = RETRIEVE_HEDGE_AFTER_MS * 2;
@@ -169,9 +209,10 @@ async fn settle_retrieve_attempt(
     accounting_peer: Arc<Mutex<PeerAccounting>>,
     refresh_chan: mpsc::Sender<RefreshmentInstruction>,
     retrieve_result: Option<Vec<u8>>,
+    expect: ChunkShape,
 ) -> RetrieveAttemptResult {
     if let Some(chunk) = retrieve_result {
-        let (chunk_valid, soc) = verify_chunk(&caddr, &chunk);
+        let (chunk_valid, soc) = verify_chunk(&caddr, &chunk, expect);
         if chunk_valid {
             apply_credit(&accounting_peer, req_price, &refresh_chan).await;
             return RetrieveAttemptResult {
@@ -192,6 +233,7 @@ async fn retrieve_attempt(
     control: StreamControl,
     refresh_chan: mpsc::Sender<RefreshmentInstruction>,
     admission: Option<RetrieveAdmission>,
+    expect: ChunkShape,
 ) -> RetrieveAttemptResult {
     let ReservedRetrievePeer {
         peer,
@@ -229,6 +271,7 @@ async fn retrieve_attempt(
         accounting_peer,
         refresh_chan,
         retrieve_result,
+        expect,
     )
     .await
 }
@@ -725,6 +768,7 @@ impl<'a> RawFetchQueue<'a> {
             .chunks
             .try_send(crate::ChunkRetrieveRequest {
                 address: completion_key.request_address.to_vec(),
+                expect: ChunkShape::Cac,
                 chan: chan_out,
                 cancel: self.cancel.clone(),
                 admission: Some(registration.shared.admission.clone()),
@@ -758,10 +802,15 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) -> bool
     flight.shared.admission.close();
 
     let usable = (erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len());
+    // `canonical_cac` is not only a verdict, it gates the decoded-chunk cache
+    // that the tree walk uses as its handoff — so with verification off this
+    // has to fall through to the structural check rather than to `false`, or
+    // nothing resolves at all.
     let canonical_cac = usable
         && ((key.request_address.len() == HASH_SIZE
             && key.request_address == key.expected_cac
             && flight.shared.admission.returned_cac())
+            || !verify_content_addresses()
             || valid_cac(&chunk, &key.expected_cac));
     let chunk = Bytes::from(chunk);
     let delivered = if usable { chunk } else { Bytes::new() };
@@ -1474,7 +1523,11 @@ async fn fetch_data_group_indices_streaming(
     for index in missing_indices {
         let reference = &data_references[index];
         let raw = reconstructed_shards[index].take()?;
-        if !valid_cac(&raw, &reference[..HASH_SIZE]) {
+        // Reed-Solomon output, not a peer's reply: this check says the
+        // reconstruction itself was sound. It follows the same switch anyway,
+        // because a run measuring the cost of retrieval with hashing off should
+        // not pay for it on one path and not the others.
+        if verify_content_addresses() && !valid_cac(&raw, &reference[..HASH_SIZE]) {
             return None;
         }
         remember_raw_chunk(reference.clone(), raw.into());
@@ -1807,6 +1860,7 @@ pub(crate) async fn retrieve_data_payload(
 
 pub async fn retrieve_chunk(
     chunk_address: &[u8],
+    expect: ChunkShape,
     control: StreamControl,
     peers: &OverlayPeerMap,
     accounting: &PeerAccountingMap,
@@ -1922,7 +1976,14 @@ pub async fn retrieve_chunk(
                 let attempt_admission = admission.clone();
                 tokio::task::spawn_local(async move {
                     let result =
-                        retrieve_attempt(selected, caddr, control, refresh_chan, attempt_admission)
+                        retrieve_attempt(
+                            selected,
+                            caddr,
+                            control,
+                            refresh_chan,
+                            attempt_admission,
+                            expect,
+                        )
                             .await;
                     let _ = attempt_out.try_send(result);
                 });
@@ -2011,12 +2072,38 @@ pub async fn retrieve_chunk(
 }
 
 
-pub fn verify_chunk(caddr: &[u8], cd: &[u8]) -> (bool, bool) {
-    if valid_cac(cd, caddr) {
-        (true, false)
-    } else {
-        let soc = valid_soc(cd, caddr);
-        (soc, soc)
+/// Whether this reply is the chunk that was asked for, and whether it is a SOC.
+///
+/// The shape comes from the caller, so the common case costs one BMT rather
+/// than two: upstream tried `valid_cac` first and fell through to `valid_soc`
+/// on failure, which made every feed update pay a wasted 22 us BMT before the
+/// one that could succeed.
+///
+/// `ChunkShape::Cac` is where the `--unsafe` default applies. `Soc` is always
+/// verified: it is the signature that says the playlist came from the stream's
+/// owner, and there are too few of them to measure.
+pub fn verify_chunk(caddr: &[u8], cd: &[u8], expect: ChunkShape) -> (bool, bool) {
+    verify_chunk_with(caddr, cd, expect, verify_content_addresses())
+}
+
+/// `verify_chunk` with the switch passed in rather than read from the process.
+///
+/// Separate so the two behaviours can be tested without a shared static: cargo
+/// runs a crate's tests on parallel threads in one process, so a test that set
+/// the global raced any test that read it.
+fn verify_chunk_with(caddr: &[u8], cd: &[u8], expect: ChunkShape, verify: bool) -> (bool, bool) {
+    match expect {
+        ChunkShape::Soc => {
+            let soc = valid_soc(cd, caddr);
+            (soc, soc)
+        }
+        ChunkShape::Cac => {
+            if verify {
+                (valid_cac(cd, caddr), false)
+            } else {
+                (chunk_structurally_usable(cd), false)
+            }
+        }
     }
 }
 
@@ -2060,6 +2147,7 @@ async fn get_feed_probe_chunk(
     if chunk_retrieve_chan
         .try_send(crate::ChunkRetrieveRequest {
             address: data_address,
+            expect: ChunkShape::Soc,
             chan: chan_out,
             cancel: None,
             admission: Some(admission.clone()),
@@ -2345,5 +2433,88 @@ mod raw_fetch_tests {
             cached_raw_chunk(&encrypted_reference).as_deref(),
             Some(raw.as_slice())
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use crate::conventions::content_address_array;
+
+    fn chunk(fill: u8) -> Vec<u8> {
+        let mut chunk = vec![0u8; erasure_coding::SPAN_SIZE + 4096];
+        chunk[..erasure_coding::SPAN_SIZE].copy_from_slice(&4096u64.to_le_bytes());
+        for (index, byte) in chunk[erasure_coding::SPAN_SIZE..].iter_mut().enumerate() {
+            *byte = (index as u8) ^ fill;
+        }
+        chunk
+    }
+
+    #[test]
+    fn verification_on_rejects_the_wrong_chunk() {
+        let good = chunk(0x5a);
+        let address = content_address_array(&good).unwrap();
+
+        assert_eq!(
+            verify_chunk_with(address.as_slice(), &good, ChunkShape::Cac, true),
+            (true, false)
+        );
+        // A peer that answers with a different, perfectly well-formed chunk.
+        assert_eq!(
+            verify_chunk_with(address.as_slice(), &chunk(0x17), ChunkShape::Cac, true),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn verification_off_believes_any_well_formed_reply() {
+        let address = content_address_array(&chunk(0x5a)).unwrap();
+
+        // This is the trade, stated as a test: the wrong chunk is accepted.
+        assert_eq!(
+            verify_chunk_with(address.as_slice(), &chunk(0x17), ChunkShape::Cac, false),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn absence_is_still_absence_with_verification_off() {
+        let address = content_address_array(&chunk(0x5a)).unwrap();
+
+        // What a peer without the chunk actually sends, and the whole of the
+        // retry signal that survives: empty, and anything too short or too long
+        // to be a chunk, still fails and still moves the caller to the next peer.
+        for reply in [
+            Vec::new(),
+            vec![0u8; erasure_coding::SPAN_SIZE - 1],
+            vec![0u8; CHUNK_WITH_SPAN_SIZE + 1],
+        ] {
+            assert_eq!(
+                verify_chunk_with(address.as_slice(), &reply, ChunkShape::Cac, false),
+                (false, false),
+                "a {} byte reply must not count as delivery",
+                reply.len()
+            );
+        }
+    }
+
+    #[test]
+    fn feed_updates_are_authenticated_whatever_the_switch_says() {
+        let address = [0u8; 32];
+        // Not a SOC, and no signature to recover an owner from.
+        let not_a_soc = chunk(0x5a);
+        for verify in [true, false] {
+            assert_eq!(
+                verify_chunk_with(&address, &not_a_soc, ChunkShape::Soc, verify),
+                (false, false),
+                "verification on: {verify}"
+            );
+        }
+    }
+
+    /// The default is `--unsafe`, and a change to it should be deliberate.
+    #[test]
+    fn the_process_default_is_not_to_verify() {
+        assert!(!VERIFY_CONTENT_ADDRESSES.load(AtomicOrdering::Relaxed));
     }
 }

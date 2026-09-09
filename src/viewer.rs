@@ -324,6 +324,30 @@ pub fn dial_rate() -> u64 {
     crate::dial_pacing::dial_rate_per_second()
 }
 
+/// Set whether retrieved chunks are checked against the address that was asked
+/// for, before starting a node. **Off by default** (`--unsafe`).
+///
+/// A BMT over a 4 KB chunk is 128 keccak permutations and 22.3 us, and a
+/// profile of a retrieving viewer on 6-core x86 put it at **15% of all CPU** —
+/// the largest single item, and the reason the default is off: the rig exists
+/// to find out how many viewers a machine can hold.
+///
+/// What it costs to have off is not only integrity. Verification is the retry
+/// signal: with it off, only an empty or wrong-length reply distinguishes "this
+/// peer does not have the chunk" from "here it is". Absence still works, since
+/// a peer without the chunk sends nothing. A peer sending well-formed *wrong*
+/// bytes is believed, and the damage appears in whatever decodes the segments.
+///
+/// Feed updates are authenticated either way — see `verify_chunk`.
+pub fn set_verify_chunks(verify: bool) {
+    crate::retrieval::set_verify_content_addresses(verify);
+}
+
+/// Whether retrieved chunks are being verified against their addresses.
+pub fn verify_chunks() -> bool {
+    crate::retrieval::verify_content_addresses()
+}
+
 /// A live stream being followed forward.
 ///
 /// The feed is polled by a background task on the same `LocalSet`, so the

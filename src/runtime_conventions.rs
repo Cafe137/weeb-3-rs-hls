@@ -49,6 +49,10 @@ pub(crate) fn chunk_retrieve_channel() -> (ChunkRetrieveSender, ChunkRetrieveRec
 
 pub(crate) struct ChunkRetrieveRequest {
     pub address: Vec<u8>,
+    /// What the requester asked for. Both senders know for certain: the
+    /// bytes-tree walk asks for content-addressed chunks, the feed path for
+    /// single-owner ones. Threading it means a reply is hashed once at most.
+    pub expect: crate::conventions::ChunkShape,
     pub chan: mpsc::Sender<Vec<u8>>,
     pub cancel: Option<RetrieveCancelToken>,
     pub admission: Option<retrieval_conventions::RetrieveAdmission>,

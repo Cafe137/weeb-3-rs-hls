@@ -23,8 +23,8 @@
 //! in `CLAUDE.md` and `LIVE-PLAN.md` was extracted with `sed` and `awk`, which
 //! is fine for one viewer and untenable for hundreds.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -37,12 +37,24 @@ use serde_json::{Value, json};
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use weeb_3::viewer::{
     LiveStream, SWARM_MAINNET, SWARM_TESTNET, StreamPlaylist, StreamSegment, Viewer, dial_rate,
-    peer_limit, run_on_local_set, set_dial_rate, set_peer_limit,
+    peer_limit, run_on_local_set, set_dial_rate, set_peer_limit, set_verify_chunks, verify_chunks,
 };
 
 /// Peers to wait for before asking the network for anything.
+///
+/// `--peer-up <n>` raises it. A fleet does: a viewer that starts retrieving at
+/// 25 peers is still verifying certificate chains for the other 175 while it
+/// walks its first chunk tree, and both halves run on the one `LocalSet`
+/// thread. Holding until the footprint is complete separates the two costs.
 const WATCH_MINIMUM_PEERS: u64 = 25;
 const WATCH_PEER_TIMEOUT_MS: u64 = 60_000;
+/// How long `--peer-up` waits for its target before going on with what it has.
+///
+/// Generous, because the point of a high target is to reach it: a box holding
+/// 50 viewers paces its dials against every other viewer's. Reaching the
+/// deadline is not an error — the viewer proceeds and reports what it has, and
+/// the fleet decides whether a short-peered viewer invalidates the run.
+const PEER_UP_TIMEOUT_MS: u64 = 300_000;
 /// Segments to pull in the watch run. Enough to prove a real playback runway.
 const WATCH_SEGMENTS: usize = 8;
 /// How often the peering curve is reported while watching.
@@ -186,10 +198,96 @@ impl Shutdown {
     }
 }
 
+/// A barrier the caller opens when the fleet is ready to start watching.
+///
+/// Under `--hold` the viewer peers, parks, and does not touch the network again
+/// until a line arrives on stdin. That is what lets a cohort separate its join
+/// phase from its watch phase: every viewer holds its full peer footprint,
+/// nobody is still dialing, and then they all start together. Without it the
+/// two phases interleave, and a run's throughput is an average over its own
+/// ramp.
+///
+/// A closed stdin releases too, and says so in the event stream. A barrier that
+/// silently never opens would hang a run; one that silently opens at once would
+/// void the separation without anyone noticing.
+struct Release {
+    released: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    /// Why it opened, once it has. `None` while still held.
+    reason: Arc<Mutex<Option<&'static str>>>,
+}
+
+impl Release {
+    /// An already-open barrier, for every run that was not asked to hold.
+    fn open() -> Self {
+        Self {
+            released: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            reason: Arc::new(Mutex::new(Some("not held"))),
+        }
+    }
+
+    /// A barrier that opens on the first line of stdin.
+    ///
+    /// A plain thread rather than `tokio::io::stdin`: the node is `!Send` and
+    /// owns the `LocalSet` thread for the whole run, and this way the blocking
+    /// read cannot be in the way of a poll.
+    fn install() -> Self {
+        let released = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let reason = Arc::new(Mutex::new(None));
+        let flag = released.clone();
+        let notify = wake.clone();
+        let why = reason.clone();
+
+        std::thread::Builder::new()
+            .name("release".into())
+            .spawn(move || {
+                let mut line = String::new();
+                let read = std::io::stdin().read_line(&mut line);
+                let opened = match read {
+                    Ok(0) => "stdin closed",
+                    Ok(_) => "released on stdin",
+                    Err(_) => "stdin unreadable",
+                };
+                if let Ok(mut slot) = why.lock() {
+                    *slot = Some(opened);
+                }
+                flag.store(true, Ordering::Release);
+                // `notify_one` stores a permit, so a release that arrives
+                // between a flag check and the next await is not lost.
+                notify.notify_one();
+            })
+            .ok();
+
+        Self {
+            released,
+            wake,
+            reason,
+        }
+    }
+
+    fn released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    fn reason(&self) -> &'static str {
+        self.reason.lock().ok().and_then(|slot| *slot).unwrap_or("released")
+    }
+
+    async fn wait(&self) {
+        self.wake.notified().await;
+    }
+}
+
 /// Everything the run modes need that is not the viewer itself.
 struct Run {
     metrics: Metrics,
     shutdown: Shutdown,
+    /// The `--hold` barrier, already open unless the run was asked to hold.
+    release: Release,
+    /// Peers to reach before the first request. `--peer-up`.
+    peer_up: u64,
     segments: usize,
     duration: Option<Duration>,
     idle: u64,
@@ -238,8 +336,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (Some(owner), Some(topic)) = (args.get(1), args.get(2)) else {
                 eprintln!(
                     "usage: weeb-3-rs-hls watch <owner> <topic> [--live] [--segments <n>] \
-                     [--duration <s>] [--peers <n>] [--dial-rate <n>] [--metrics json] \
-                     [testnet]"
+                     [--duration <s>] [--peers <n>] [--dial-rate <n>] \
+                     [--peer-up <n>] [--hold] [--verify] [--metrics json] [testnet]"
                 );
                 std::process::exit(2);
             };
@@ -308,6 +406,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(rate) = flag("--dial-rate").and_then(|value| value.parse::<u64>().ok()) {
         set_dial_rate(rate);
     }
+    // `--unsafe` (the default) skips the BMT check on retrieved chunk content;
+    // `--verify` puts it back. It is worth 15% of a viewer's CPU, measured, and
+    // what it buys is described on `set_verify_chunks`: integrity, and the
+    // signal that tells a bad reply from an absent one. A rig sizing machines
+    // wants it off; anything drawing conclusions about correctness wants it on.
+    if args.iter().any(|arg| arg == "--verify") {
+        set_verify_chunks(true);
+    } else if args.iter().any(|arg| arg == "--unsafe") {
+        set_verify_chunks(false);
+    }
+
+    // `--peer-up <n>` is how many peers to hold before the first request, and
+    // `--hold` parks the viewer there until stdin says go. Together they are
+    // what a cohort needs to separate joining from watching; alone, `--peer-up`
+    // is still the honest setting for a single viewer being timed.
+    let peer_up = flag("--peer-up")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(WATCH_MINIMUM_PEERS);
+    let hold = args.iter().any(|arg| arg == "--hold");
     let metrics_json = flag("--metrics").is_some_and(|value| value == "json");
     let network_id = if args.iter().any(|arg| arg == "testnet") {
         SWARM_TESTNET
@@ -319,6 +436,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run = Run {
             metrics: Metrics::new(metrics_json),
             shutdown: Shutdown::install(),
+            release: if hold {
+                Release::install()
+            } else {
+                Release::open()
+            },
+            peer_up,
             segments,
             duration,
             idle,
@@ -341,6 +464,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "topic": topic,
                 "peer_limit": peer_limit(),
                 "dial_rate": dial_rate(),
+                "peer_up": peer_up,
+                "hold": hold,
+                "verify_chunks": verify_chunks(),
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         );
@@ -867,19 +993,98 @@ async fn show_feed(viewer: &Viewer, run: &Run, owner: &str, topic: &str) -> Resu
     Ok(())
 }
 
-/// Wait for enough peers to ask the network for anything.
+/// Wait for enough peers to ask the network for anything, then for the
+/// caller's go-ahead if the run was asked to hold.
+///
+/// The peering curve is reported once a second here rather than only at the
+/// end. A viewer holding for its full 200-peer footprint can be waiting a
+/// minute on a loaded box, and a fleet deciding when to release the cohort
+/// needs to watch that curve arrive, not learn about it afterwards.
 async fn peer_up(viewer: &Viewer, run: &Run) -> Result<u64, String> {
-    let peers = viewer
-        .wait_for_connections(WATCH_MINIMUM_PEERS, WATCH_PEER_TIMEOUT_MS)
-        .await;
+    let target = run.peer_up.max(1);
+    let deadline_ms = if target > WATCH_MINIMUM_PEERS {
+        PEER_UP_TIMEOUT_MS
+    } else {
+        WATCH_PEER_TIMEOUT_MS
+    };
+    let started = Instant::now();
+    let mut peers = viewer.connections().await;
+    while peers < target {
+        if run.shutdown.requested() {
+            break;
+        }
+        let waited = started.elapsed().as_millis() as u64;
+        let Some(remaining) = deadline_ms.checked_sub(waited).filter(|left| *left > 0) else {
+            tracing::warn!(
+                peers,
+                target,
+                "peer-up deadline reached; going on with what we have"
+            );
+            break;
+        };
+        // A second at a time, so the curve is reported while it climbs.
+        peers = viewer
+            .wait_for_connections(target, remaining.min(1_000))
+            .await;
+        report_peer_up(viewer, run, peers);
+    }
     let dial_failures = viewer.dial_failures();
-    tracing::info!(peers, dial_failures, "peered");
+    tracing::info!(peers, target, dial_failures, "peered");
     run.metrics
         .emit("peers", json!({ "peers": peers, "dial_failures": dial_failures }));
     if peers == 0 {
         return Err("no peers; cannot retrieve anything".to_string());
     }
-    Ok(peers)
+    await_release(viewer, run, peers).await;
+    Ok(viewer.connections().await.max(peers))
+}
+
+fn report_peer_up(viewer: &Viewer, run: &Run, peers: u64) {
+    run.metrics.emit(
+        "peers",
+        json!({ "peers": peers, "dial_failures": viewer.dial_failures() }),
+    );
+}
+
+/// Park until the caller opens the barrier, reporting peers as they settle.
+///
+/// Nothing is asked of the network here beyond the peering the node does on its
+/// own — in particular the feed is *not* probed, which is the whole point. A
+/// viewer that entered `join` early would poll a feed that may not exist yet,
+/// five probes a second, and a cohort of them would put that load on one
+/// neighbourhood for the length of the hold.
+async fn await_release(viewer: &Viewer, run: &Run, peers: u64) {
+    if run.release.released() {
+        return;
+    }
+    let started = Instant::now();
+    run.metrics
+        .emit("held", json!({ "peers": peers, "peer_up": run.peer_up }));
+    tracing::info!(peers, "held at the barrier; waiting for the go-ahead on stdin");
+
+    while !run.release.released() && !run.shutdown.requested() {
+        tokio::select! {
+            _ = run.release.wait() => break,
+            _ = run.shutdown.wait() => break,
+            _ = tokio::time::sleep(Duration::from_millis(1_000)) => {
+                report_peer_up(viewer, run, viewer.connections().await);
+                drain(viewer);
+            }
+        }
+    }
+
+    let peers = viewer.connections().await;
+    let held_ms = started.elapsed().as_millis() as u64;
+    let reason = if run.release.released() {
+        run.release.reason()
+    } else {
+        "stop requested"
+    };
+    tracing::info!(peers, held_ms, reason, "released");
+    run.metrics.emit(
+        "released",
+        json!({ "peers": peers, "held_ms": held_ms, "reason": reason }),
+    );
 }
 
 async fn idle_after(viewer: &Viewer, run: &Run) {

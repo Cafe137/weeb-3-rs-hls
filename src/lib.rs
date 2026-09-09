@@ -1662,6 +1662,7 @@ impl Weeb3 {
                     }
 
                     let n = request.address;
+                    let expect = request.expect;
                     let chan = request.chan;
                     let cancel = request.cancel;
                     let admission = request.admission;
@@ -1720,6 +1721,7 @@ impl Weeb3 {
 
                             retrieve_chunk(
                                 &n,
+                                expect,
                                 retrieval_control,
                                 &wings.overlay_peers,
                                 &wings.accounting_peers,

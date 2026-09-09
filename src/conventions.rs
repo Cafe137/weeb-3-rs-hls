@@ -171,6 +171,30 @@ pub fn valid_cac(chunk_content: &[u8], address: &[u8]) -> bool {
     content_address_array(chunk_content).is_some_and(|expected| address == expected.as_slice())
 }
 
+/// Which kind of chunk a retrieval asked for.
+///
+/// Both request sites know this for certain — the bytes-tree walk only ever
+/// asks for content-addressed chunks, and a feed address is a single-owner
+/// address by construction (`get_feed_address`) — so the expectation is
+/// threaded through rather than discovered by hashing the reply twice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChunkShape {
+    /// Content-addressed: the address is the BMT root hashed with the span.
+    Cac,
+    /// Single-owner: the address is keccak(id ‖ owner), the payload wrapped.
+    Soc,
+}
+
+/// Whether a reply could be a chunk at all, without hashing it.
+///
+/// The length bounds are the same ones the fetch queue applies, and they are
+/// what makes absence distinguishable from delivery: a peer that does not have
+/// a chunk replies empty, and an empty reply fails here. That is the whole of
+/// the retry signal left when content verification is off.
+pub fn chunk_structurally_usable(chunk_content: &[u8]) -> bool {
+    (SPAN_SIZE..=SPAN_SIZE + CHUNK_SIZE).contains(&chunk_content.len())
+}
+
 pub fn valid_soc(chunk_content: &[u8], address: &[u8]) -> bool {
     if chunk_content.len() < 97 + SPAN_SIZE {
         return false;
