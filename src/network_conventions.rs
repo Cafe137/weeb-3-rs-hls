@@ -869,6 +869,12 @@ pub(crate) async fn start_owned_connection_attempt(
         }
     };
     if attempt_owned {
+        // Paced here rather than at either caller because this is the one place
+        // a viewer opens a socket, and both the bootnode burst and the
+        // gossip-fed scheduler come through it. The token is what stops ~1100
+        // TLS handshakes from landing on a single core inside six seconds; see
+        // `dial_pacing`.
+        await_dial_permit().await;
         swarm.lock().await.dial(options)?;
     }
     Ok(attempt_owned)

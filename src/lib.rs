@@ -54,6 +54,9 @@ use accounting::{
 mod addresses;
 use addresses::{browser_dial_address, deserialize_underlays, is_publicly_dialable_underlay};
 
+mod dial_pacing;
+use dial_pacing::await_dial_permit;
+
 mod erasure_coding;
 
 mod feed;

@@ -36,8 +36,8 @@ use serde_json::{Value, json};
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use weeb_3::viewer::{
-    LiveStream, SWARM_MAINNET, SWARM_TESTNET, StreamPlaylist, StreamSegment, Viewer, peer_limit,
-    run_on_local_set, set_peer_limit,
+    LiveStream, SWARM_MAINNET, SWARM_TESTNET, StreamPlaylist, StreamSegment, Viewer, dial_rate,
+    peer_limit, run_on_local_set, set_dial_rate, set_peer_limit,
 };
 
 /// Peers to wait for before asking the network for anything.
@@ -238,7 +238,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (Some(owner), Some(topic)) = (args.get(1), args.get(2)) else {
                 eprintln!(
                     "usage: weeb-3-rs-hls watch <owner> <topic> [--live] [--segments <n>] \
-                     [--duration <s>] [--peers <n>] [--metrics json] [testnet]"
+                     [--duration <s>] [--peers <n>] [--dial-rate <n>] [--metrics json] \
+                     [testnet]"
                 );
                 std::process::exit(2);
             };
@@ -301,6 +302,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(limit) = flag("--peers").and_then(|value| value.parse::<u64>().ok()) {
         set_peer_limit(limit);
     }
+    // `--dial-rate <n>` paces the join: connections opened per second, 0 for the
+    // unthrottled burst. Lower it when many viewers share a machine, because the
+    // join is the only part of a viewer's life that costs a whole core.
+    if let Some(rate) = flag("--dial-rate").and_then(|value| value.parse::<u64>().ok()) {
+        set_dial_rate(rate);
+    }
     let metrics_json = flag("--metrics").is_some_and(|value| value == "json");
     let network_id = if args.iter().any(|arg| arg == "testnet") {
         SWARM_TESTNET
@@ -333,6 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "owner": owner,
                 "topic": topic,
                 "peer_limit": peer_limit(),
+                "dial_rate": dial_rate(),
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         );

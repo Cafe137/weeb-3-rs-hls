@@ -307,6 +307,23 @@ pub fn peer_limit() -> u64 {
     crate::accounting::connection_buildup_limit()
 }
 
+/// Set how many connections per second this process may open, before starting
+/// a node. 0 removes the limit.
+///
+/// The default of 50/s exists because the join, not the watching, is what makes
+/// a viewer expensive: ~1100 dials at ~2.6 ms of P-384 certificate verification
+/// each, all of it on the one thread the `!Send` node runs on. Unpaced that is
+/// a full core for six seconds, which starves every viewer already running on
+/// the machine. Pacing changes nothing about *what* is dialed.
+pub fn set_dial_rate(rate: u64) {
+    crate::dial_pacing::set_dial_rate_per_second(rate);
+}
+
+/// Connections per second this process will open, or 0 when unthrottled.
+pub fn dial_rate() -> u64 {
+    crate::dial_pacing::dial_rate_per_second()
+}
+
 /// A live stream being followed forward.
 ///
 /// The feed is polled by a background task on the same `LocalSet`, so the
